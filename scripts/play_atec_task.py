@@ -25,6 +25,12 @@ parser.add_argument(
     default=False,
     help="Enable debug prints for per-step reward/time metrics.",
 )
+parser.add_argument(
+    "--keyboard",
+    action="store_true",
+    default=False,
+    help="Enable keyboard teleop (WASD=move, QE=yaw, ZX=height, R=reset).",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -54,6 +60,7 @@ import atec_rl_lab.tasks  # noqa: F401, E402 (register your tasks)
 from isaaclab_tasks.utils import parse_env_cfg
 from rl_utils import camera_follow
 from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
+from keyboard_teleop import KeyboardTeleop
 
 from demo.solution import AlgSolution
 solution = AlgSolution()
@@ -63,6 +70,7 @@ def play() -> tuple[float, float]:
         raise ValueError("Please provide --task, e.g. --task ATEC-TaskA-G1")
 
     is_task_e = isinstance(args_cli.task, str) and args_cli.task.startswith("ATEC-TaskE")
+    teleop = KeyboardTeleop() if args_cli.keyboard else None
     # -------------------------------------------------------------------------
     # Create env (plain Gym env)
     # -------------------------------------------------------------------------
@@ -73,9 +81,8 @@ def play() -> tuple[float, float]:
         use_fabric=not args_cli.disable_fabric
     )
 
-    # TODO: simulate getting action spec from jason string (e.g. from a file or network)
-    # action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
-    # action_spec_json = json.dumps(action_spec)
+    action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
+    action_spec_json = json.dumps(action_spec)
 
     # New Feature: apply safe action spec to env config (e.g. for scaling/clipping actions from your solution)
     env_cfg = apply_safe_action_spec(env_cfg, action_spec_json)
@@ -120,7 +127,11 @@ def play() -> tuple[float, float]:
             start_time = time.time()
 
             # ===== Your controller goes here =====
+            if teleop is not None:
+                nav_cmd, height_cmd = teleop.advance()
+                solution.set_keyboard_command(nav_cmd, height_cmd)
             resp = solution.predicts(obs, total_episode_reward)
+            print(solution.get_debug_snapshot())
             giveup = resp["giveup"]
             if giveup:
                 break
@@ -128,7 +139,7 @@ def play() -> tuple[float, float]:
             actions = torch.tensor(actions, dtype=torch.float32, device='cuda').view(1, -1)
             obs, reward, terminated, truncated, info = env.step(actions)
             if not is_task_e:
-                camera_follow(env)
+                pass  # camera_follow(env)
 
             sim_dt = info["Step_dt"]
             if isinstance(reward, torch.Tensor):
@@ -162,6 +173,8 @@ def play() -> tuple[float, float]:
                     time.sleep(sleep_time)
 
     env.close()
+    if teleop is not None:
+        teleop.close()
 
     return total_episode_reward, total_elapsed_time
 

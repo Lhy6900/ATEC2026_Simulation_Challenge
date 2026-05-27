@@ -12,6 +12,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.sensors import MultiMeshRayCasterCfg
+from isaaclab.actuators import ImplicitActuatorCfg
 import isaaclab.sim as sim_utils
 
 from atec_rl_lab.tasks.task_base import BaseEnvCfg
@@ -143,12 +144,41 @@ class TaskDEnvG1Cfg(TaskDEnvCfg):
     def __post_init__(self):
         from atec_rl_lab.assets.robots import UNITREE_G1_29DOF_DEX1_CFG
 
-        self.scene.robot = UNITREE_G1_29DOF_DEX1_CFG.replace(
+        robot_cfg = UNITREE_G1_29DOF_DEX1_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state = UNITREE_G1_29DOF_DEX1_CFG.init_state.replace(
                 pos=(-3, 0.0, 0.8),
             )
         )
+        robot_cfg.actuators["legs"] = ImplicitActuatorCfg(
+            joint_names_expr=robot_cfg.actuators["legs"].joint_names_expr,
+            effort_limit_sim=robot_cfg.actuators["legs"].effort_limit_sim,
+            velocity_limit_sim=robot_cfg.actuators["legs"].velocity_limit_sim,
+            stiffness={
+                ".*_hip_yaw_joint": 150.0,
+                ".*_hip_roll_joint": 150.0,
+                ".*_hip_pitch_joint": 150.0,
+                ".*_knee_joint": 200.0,
+                ".*waist.*": 250.0,
+            },
+            damping={
+                ".*_hip_yaw_joint": 2.0,
+                ".*_hip_roll_joint": 2.0,
+                ".*_hip_pitch_joint": 2.0,
+                ".*_knee_joint": 4.0,
+                ".*waist.*": 5.0,
+            },
+            armature=robot_cfg.actuators["legs"].armature,
+        )
+        robot_cfg.actuators["feet"] = ImplicitActuatorCfg(
+            joint_names_expr=robot_cfg.actuators["feet"].joint_names_expr,
+            effort_limit_sim=robot_cfg.actuators["feet"].effort_limit_sim,
+            velocity_limit_sim=robot_cfg.actuators["feet"].velocity_limit_sim,
+            stiffness=40.0,
+            damping=2.0,
+            armature=robot_cfg.actuators["feet"].armature,
+        )
+        self.scene.robot = robot_cfg
         super().__post_init__()
 
         # self.terminations.illegal_contact.params["sensor_cfg"].body_names = [
