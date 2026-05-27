@@ -31,6 +31,13 @@ parser.add_argument(
     default=False,
     help="Enable keyboard teleop (WASD=move, QE=yaw, ZX=height, R=reset).",
 )
+parser.add_argument(
+    "--policy",
+    type=str,
+    default="gr00t",
+    choices=["gr00t", "blind"],
+    help="Locomotion policy: gr00t (GR00T WBC) or blind (policy.pt). Default: gr00t.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -62,7 +69,8 @@ from rl_utils import camera_follow
 from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
 from keyboard_teleop import KeyboardTeleop
 
-from demo.solution import AlgSolution
+from demo.solution import set_policy, AlgSolution
+set_policy(args_cli.policy)
 solution = AlgSolution()
 
 def play() -> tuple[float, float]:
@@ -128,10 +136,17 @@ def play() -> tuple[float, float]:
 
             # ===== Your controller goes here =====
             if teleop is not None:
-                nav_cmd, height_cmd = teleop.advance()
-                solution.set_keyboard_command(nav_cmd, height_cmd)
+                nav_cmd, height_cmd, switch = teleop.advance()
+                if switch is not None:
+                    from demo.solution import set_policy, get_policy_name, _ensure_impl
+                    if set_policy(switch if switch != "homie" else "gr00t"):
+                        _ensure_impl()
+                        print(f"[play] Switched to policy: {get_policy_name()}")
+                if hasattr(solution, "set_keyboard_command"):
+                    solution.set_keyboard_command(nav_cmd, height_cmd)
             resp = solution.predicts(obs, total_episode_reward)
-            print(solution.get_debug_snapshot())
+            if hasattr(solution, "get_debug_snapshot"):
+                print(solution.get_debug_snapshot())
             giveup = resp["giveup"]
             if giveup:
                 break
