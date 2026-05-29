@@ -147,6 +147,7 @@ from keyboard_teleop import KeyboardTeleop
 from lidar_perception import (
     build_task_d_lidar_prior,
     estimate_task_d_poses_from_lidar,
+    LidarPoseStabilizer,
 )
 from sensor_vis_utils import (
     depth_to_world_points,
@@ -466,6 +467,7 @@ class SensorSceneMarkers:
         self.depth_stride = 24
         self.lidar_stride = 1
         self.lidar_prior = lidar_prior
+        self.lidar_pose_stabilizer = LidarPoseStabilizer()
         self.lidar_pose_logger = lidar_pose_logger
         self._depth_marker = None
         self._lidar_marker = None
@@ -623,7 +625,7 @@ class SensorSceneMarkers:
             prior=self.lidar_prior,
             max_distance=max_distance,
         )
-        return result
+        return self.lidar_pose_stabilizer.update(result)
 
     def _build_pose_report(self) -> str | None:
         scene = self._get_scene()

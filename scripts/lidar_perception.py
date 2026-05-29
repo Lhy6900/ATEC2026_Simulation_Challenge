@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -55,10 +56,254 @@ class LidarPerceptionResult:
     num_ground_inliers: int
 
 
+class LidarPoseStabilizer:
+    """Temporal stabilizer for slowly moving LiDAR-relative object poses."""
+
+    def __init__(
+        self,
+        init_samples: int = 5,
+        max_step_xy: float = 0.8,
+        max_yaw_step: float = math.radians(20.0),
+        max_anchor_yaw_error: float = math.radians(15.0),
+    ):
+        self.init_samples = max(1, int(init_samples))
+        self.max_step_xy = float(max_step_xy)
+        self.max_yaw_step = float(max_yaw_step)
+        self.max_anchor_yaw_error = float(max_anchor_yaw_error)
+        self._box_init: list[Pose2DEstimate] = []
+        self._box: Pose2DEstimate | None = None
+        self._box_yaw_anchor: float | None = None
+        self._ditch: Pose2DEstimate | None = None
+        self._ditch_yaw_anchor: float | None = None
+        self._ditch_init: list[Pose2DEstimate] = []
+
+    def update(self, result: LidarPerceptionResult) -> LidarPerceptionResult:
+        box = self._update_box(result.box)
+        ditch = self._update_ditch(result.ditch)
+        return LidarPerceptionResult(
+            box=box,
+            ditch=ditch,
+            num_points=result.num_points,
+            num_ground_inliers=result.num_ground_inliers,
+        )
+
+    def _update_box(self, estimate: Pose2DEstimate) -> Pose2DEstimate:
+        if not estimate.valid:
+            return self._box if self._box is not None else estimate
+
+        if self._box is not None:
+            estimate = replace(estimate, yaw=self._closest_box_yaw(self._box.yaw, estimate.yaw))
+        else:
+            estimate = replace(estimate, yaw=canonical_axis_yaw_for_display(estimate.yaw))
+
+        if len(self._box_init) < self.init_samples:
+            self._box_init.append(estimate)
+            if len(self._box_init) < self.init_samples:
+                self._box = self._provisional_box_estimate(estimate)
+                return self._box
+            anchor_yaw, _ = dominant_axis_yaw([item.yaw for item in self._box_init])
+            anchor_yaw = canonical_axis_yaw_for_display(anchor_yaw)
+            self._box_yaw_anchor = anchor_yaw
+            anchor_xy = np.median(np.array([[item.x, item.y] for item in self._box_init], dtype=np.float32), axis=0)
+            anchor_conf = float(np.mean([item.confidence for item in self._box_init]))
+            anchor_pts = int(np.median([item.num_points for item in self._box_init]))
+            self._box = replace(
+                estimate,
+                x=float(anchor_xy[0]),
+                y=float(anchor_xy[1]),
+                yaw=anchor_yaw,
+                confidence=max(estimate.confidence, anchor_conf),
+                num_points=anchor_pts,
+                message="stabilized_init",
+            )
+            return self._box
+
+        if self._box is None:
+            self._box = estimate
+            return estimate
+
+        prev = self._box
+        yaw_reference = self._box_yaw_anchor if self._box_yaw_anchor is not None else prev.yaw
+        measured_yaw = self._closest_box_yaw(yaw_reference, estimate.yaw)
+        measured_yaw = align_axis_yaw_to_reference(measured_yaw, prev.yaw)
+        if axis_yaw_error(measured_yaw, yaw_reference) > self.max_anchor_yaw_error:
+            measured_yaw = prev.yaw
+        if abs(measured_yaw - prev.yaw) > self.max_yaw_step:
+            measured_yaw = prev.yaw
+
+        measured_xy = np.array([estimate.x, estimate.y], dtype=np.float32)
+        prev_xy = np.array([prev.x, prev.y], dtype=np.float32)
+        delta_xy = measured_xy - prev_xy
+        dist = float(np.linalg.norm(delta_xy))
+        if dist > self.max_step_xy:
+            measured_xy = prev_xy + delta_xy * (self.max_step_xy / max(dist, 1.0e-6))
+
+        trust = 0.20 + 0.45 * max(0.0, min(1.0, estimate.confidence))
+        yaw_trust = min(0.08, 0.015 + 0.07 * max(0.0, min(1.0, estimate.confidence)))
+        smoothed_xy = prev_xy + trust * (measured_xy - prev_xy)
+        smoothed_yaw = blend_continuous_axis_yaw(prev.yaw, measured_yaw, yaw_trust)
+        if self._box_yaw_anchor is not None:
+            smoothed_yaw = blend_continuous_axis_yaw(smoothed_yaw, self._box_yaw_anchor, 0.02)
+        self._box = replace(
+            estimate,
+            x=float(smoothed_xy[0]),
+            y=float(smoothed_xy[1]),
+            yaw=smoothed_yaw,
+            confidence=max(prev.confidence * 0.85, estimate.confidence),
+            message="stabilized",
+        )
+        return self._box
+
+    def _closest_box_yaw(self, reference_yaw: float, measured_yaw: float) -> float:
+        candidates = (
+            float(measured_yaw),
+            float(measured_yaw) + math.pi / 2.0,
+            float(measured_yaw) - math.pi / 2.0,
+        )
+        aligned = [align_axis_yaw_to_reference(yaw, reference_yaw) for yaw in candidates]
+        return min(aligned, key=lambda yaw: abs(yaw - reference_yaw))
+
+    def _provisional_box_estimate(self, fallback: Pose2DEstimate) -> Pose2DEstimate:
+        if len(self._box_init) < 2:
+            return fallback
+        anchor_yaw, count = dominant_axis_yaw([item.yaw for item in self._box_init])
+        anchor_yaw = canonical_axis_yaw_for_display(anchor_yaw)
+        if count < 2:
+            return self._box if self._box is not None else fallback
+        anchor_xy = np.median(np.array([[item.x, item.y] for item in self._box_init], dtype=np.float32), axis=0)
+        anchor_conf = float(np.mean([item.confidence for item in self._box_init]))
+        return replace(
+            fallback,
+            x=float(anchor_xy[0]),
+            y=float(anchor_xy[1]),
+            yaw=anchor_yaw,
+            confidence=max(fallback.confidence, anchor_conf),
+            message="stabilizing_init",
+        )
+
+    def _update_ditch(self, estimate: Pose2DEstimate) -> Pose2DEstimate:
+        if not estimate.valid:
+            return self._ditch if self._ditch is not None else estimate
+        estimate = replace(estimate, yaw=canonical_axis_yaw_for_display(estimate.yaw))
+        if self._ditch is None:
+            self._ditch_init.append(estimate)
+            if len(self._ditch_init) < self.init_samples:
+                self._ditch = self._provisional_ditch_estimate(estimate)
+                return self._ditch
+            anchor_yaw, _ = dominant_axis_yaw([item.yaw for item in self._ditch_init])
+            anchor_yaw = canonical_axis_yaw_for_display(anchor_yaw)
+            self._ditch_yaw_anchor = anchor_yaw
+            anchor_xy = np.median(np.array([[item.x, item.y] for item in self._ditch_init], dtype=np.float32), axis=0)
+            anchor_conf = float(np.mean([item.confidence for item in self._ditch_init]))
+            anchor_pts = int(np.median([item.num_points for item in self._ditch_init]))
+            self._ditch = replace(
+                estimate,
+                x=float(anchor_xy[0]),
+                y=float(anchor_xy[1]),
+                yaw=anchor_yaw,
+                confidence=max(estimate.confidence, anchor_conf),
+                num_points=anchor_pts,
+                message="stabilized_init",
+            )
+            return self._ditch
+
+        prev = self._ditch
+        measured_yaw = align_axis_yaw_to_reference(estimate.yaw, prev.yaw)
+        if axis_yaw_error(measured_yaw, prev.yaw) > math.radians(25.0):
+            estimate = replace(estimate, yaw=prev.yaw, confidence=min(estimate.confidence, 0.65))
+        else:
+            estimate = replace(estimate, yaw=measured_yaw)
+
+        measured_xy = np.array([estimate.x, estimate.y], dtype=np.float32)
+        prev_xy = np.array([prev.x, prev.y], dtype=np.float32)
+        delta_xy = measured_xy - prev_xy
+        max_dx = 0.45
+        max_dy = 0.35
+        if abs(float(delta_xy[0])) > max_dx or abs(float(delta_xy[1])) > max_dy:
+            measured_xy = prev_xy
+            estimate = replace(estimate, confidence=min(estimate.confidence, 0.60), message="held_xy_outlier")
+        else:
+            trust = 0.20 + 0.35 * max(0.0, min(1.0, estimate.confidence))
+            measured_xy = prev_xy + trust * delta_xy
+
+        self._ditch = replace(estimate, x=float(measured_xy[0]), y=float(measured_xy[1]))
+        return self._ditch
+
+    def _provisional_ditch_estimate(self, fallback: Pose2DEstimate) -> Pose2DEstimate:
+        if len(self._ditch_init) < 2:
+            return fallback
+        anchor_yaw, count = dominant_axis_yaw([item.yaw for item in self._ditch_init], radius=math.radians(18.0))
+        if count < 2:
+            return self._ditch if self._ditch is not None else fallback
+        anchor_xy = np.median(np.array([[item.x, item.y] for item in self._ditch_init], dtype=np.float32), axis=0)
+        anchor_conf = float(np.mean([item.confidence for item in self._ditch_init]))
+        return replace(
+            fallback,
+            x=float(anchor_xy[0]),
+            y=float(anchor_xy[1]),
+            yaw=canonical_axis_yaw_for_display(anchor_yaw),
+            confidence=max(fallback.confidence, anchor_conf),
+            message="stabilizing_init",
+        )
+
+
 def wrap_axis_yaw(yaw: float) -> float:
     """Wrap an unoriented rectangle axis to [-pi/2, pi/2)."""
     wrapped = (float(yaw) + math.pi / 2.0) % math.pi - math.pi / 2.0
     return wrapped
+
+
+def canonical_axis_yaw_for_display(yaw: float) -> float:
+    """Choose a stable display branch for an unoriented axis near +/-90 degrees."""
+    yaw = wrap_axis_yaw(yaw)
+    if yaw < 0.0 and abs(abs(yaw) - math.pi / 2.0) <= math.radians(8.0):
+        return yaw + math.pi
+    return yaw
+
+
+def align_axis_yaw_to_reference(yaw: float, reference_yaw: float) -> float:
+    """Return the equivalent axis yaw branch closest to a continuous reference."""
+    yaw = float(yaw)
+    reference_yaw = float(reference_yaw)
+    candidates = (yaw, yaw + math.pi, yaw - math.pi)
+    return min(candidates, key=lambda candidate: abs(candidate - reference_yaw))
+
+
+def axis_yaw_error(a: float, b: float) -> float:
+    return abs(align_axis_yaw_to_reference(float(a), float(b)) - float(b))
+
+
+def mean_axis_yaw(yaws: list[float] | np.ndarray) -> float:
+    if len(yaws) == 0:
+        return 0.0
+    values = np.asarray(yaws, dtype=np.float32)
+    return wrap_axis_yaw(0.5 * math.atan2(float(np.sin(2.0 * values).mean()), float(np.cos(2.0 * values).mean())))
+
+
+def blend_axis_yaw(current: float, measured: float, alpha: float) -> float:
+    alpha = max(0.0, min(1.0, float(alpha)))
+    current = float(current)
+    measured = float(measured)
+    sin2 = (1.0 - alpha) * math.sin(2.0 * current) + alpha * math.sin(2.0 * measured)
+    cos2 = (1.0 - alpha) * math.cos(2.0 * current) + alpha * math.cos(2.0 * measured)
+    return wrap_axis_yaw(0.5 * math.atan2(sin2, cos2))
+
+
+def blend_continuous_axis_yaw(current: float, measured: float, alpha: float) -> float:
+    alpha = max(0.0, min(1.0, float(alpha)))
+    measured = align_axis_yaw_to_reference(measured, current)
+    return float(current) + alpha * (measured - float(current))
+
+
+def dominant_axis_yaw(yaws: list[float], radius: float = math.radians(15.0)) -> tuple[float, int]:
+    if not yaws:
+        return 0.0, 0
+    best_cluster: list[float] = []
+    for yaw in yaws:
+        cluster = [candidate for candidate in yaws if axis_yaw_error(candidate, yaw) <= radius]
+        if len(cluster) > len(best_cluster):
+            best_cluster = cluster
+    return mean_axis_yaw(best_cluster), len(best_cluster)
 
 
 def quat_inverse_apply(quat_wxyz: np.ndarray, vectors: np.ndarray) -> np.ndarray:
@@ -287,10 +532,10 @@ def estimate_ditch_pose(points_l: np.ndarray, ground_plane: np.ndarray, prior: D
     valid = (
         np.all(np.isfinite(points_l), axis=1)
         & np.isfinite(heights)
-        & (heights < -max(0.35, 0.35 * prior.depth))
+        & (heights < -max(0.18, 0.18 * prior.depth))
     )
     candidate_points = points_l[valid]
-    clusters = cluster_xy(candidate_points[:, :2], radius=0.45, min_points=24)
+    clusters = cluster_xy(candidate_points[:, :2], radius=0.55, min_points=10)
 
     best: tuple[float, Pose2DEstimate] | None = None
     for cluster_idx in clusters:
@@ -327,8 +572,102 @@ def estimate_ditch_pose(points_l: np.ndarray, ground_plane: np.ndarray, prior: D
         if best is None or score < best[0]:
             best = (score, estimate)
 
+    edge_estimate = estimate_ditch_from_height_edges(points_l, heights, prior)
+    if edge_estimate.valid:
+        edge_score = 0.85 - edge_estimate.confidence - 0.001 * edge_estimate.num_points
+        if best is None or edge_score < best[0]:
+            best = (edge_score, edge_estimate)
+
     if best is None:
-        return Pose2DEstimate(label="ditch", message=f"no low strip cluster ({candidate_points.shape[0]} low pts)")
+        return Pose2DEstimate(
+            label="ditch",
+            message=f"no low strip/edge cluster ({candidate_points.shape[0]} low pts)",
+        )
+    return best[1]
+
+
+def estimate_ditch_from_height_edges(points_l: np.ndarray, heights: np.ndarray, prior: DitchPrior) -> Pose2DEstimate:
+    """Detect a pit from the visible ground-height discontinuity at its front edge."""
+    valid = np.all(np.isfinite(points_l), axis=1) & np.isfinite(heights) & (points_l[:, 0] > -0.5)
+    candidates = points_l[valid]
+    candidate_heights = heights[valid]
+    if candidates.shape[0] < 32:
+        return Pose2DEstimate(label="ditch", message="not enough edge candidates")
+
+    bin_size = 0.18
+    xy = candidates[:, :2]
+    bins = np.floor(xy / bin_size).astype(np.int32)
+    cell_min: dict[tuple[int, int], float] = {}
+    cell_center: dict[tuple[int, int], np.ndarray] = {}
+    for idx, cell in enumerate(bins):
+        key = (int(cell[0]), int(cell[1]))
+        height = float(candidate_heights[idx])
+        if key not in cell_min or height < cell_min[key]:
+            cell_min[key] = height
+            cell_center[key] = (np.asarray(key, dtype=np.float32) + 0.5) * bin_size
+
+    edge_points = []
+    for (cx, cy), height in cell_min.items():
+        if height > -0.12:
+            continue
+        front_heights = []
+        back_heights = []
+        for dx in (-2, -1):
+            neighbor = (cx + dx, cy)
+            if neighbor in cell_min:
+                front_heights.append(cell_min[neighbor])
+        for dx in (1, 2):
+            neighbor = (cx + dx, cy)
+            if neighbor in cell_min:
+                back_heights.append(cell_min[neighbor])
+        if front_heights and np.median(front_heights) > -0.08:
+            edge_points.append(cell_center[(cx, cy)])
+        elif back_heights and np.median(back_heights) > -0.08:
+            edge_points.append(cell_center[(cx, cy)])
+
+    if len(edge_points) < 6:
+        return Pose2DEstimate(label="ditch", message=f"not enough edge points ({len(edge_points)})")
+
+    edge_xy = np.asarray(edge_points, dtype=np.float32)
+    clusters = cluster_xy(edge_xy, radius=0.42, min_points=6)
+    best: tuple[float, Pose2DEstimate] | None = None
+    for cluster_idx in clusters:
+        cluster = edge_xy[cluster_idx]
+        if cluster.shape[0] < 6:
+            continue
+        yaw = pca_yaw(cluster)
+        u, v, proj_u, proj_v = oriented_bounds(cluster, yaw)
+        length_visible = float(np.max(proj_u) - np.min(proj_u))
+        edge_center = cluster.mean(axis=0)
+        if length_visible < 0.45:
+            continue
+        # The pit width is orthogonal to the long edge. Choose the normal that
+        # places the ditch center in front of the observed edge when possible.
+        normal = v
+        candidate_center_a = edge_center + normal * (0.5 * prior.width)
+        candidate_center_b = edge_center - normal * (0.5 * prior.width)
+        center = candidate_center_a if candidate_center_a[0] >= candidate_center_b[0] else candidate_center_b
+        front_bonus = max(0.0, min(1.0, center[0] / 3.0))
+        density_bonus = min(1.0, cluster.shape[0] / 40.0)
+        confidence = max(0.0, min(1.0, 0.35 + 0.30 * density_bonus + 0.25 * front_bonus))
+        score = -confidence - 0.001 * cluster.shape[0]
+        estimate = Pose2DEstimate(
+            label="ditch",
+            valid=True,
+            x=float(center[0]),
+            y=float(center[1]),
+            yaw=wrap_axis_yaw(yaw),
+            confidence=confidence,
+            num_points=int(cluster.shape[0]),
+            extent_x=length_visible,
+            extent_y=float(prior.width),
+            message="edge",
+        )
+        if best is None or score < best[0]:
+            best = (score, estimate)
+
+    if best is None:
+        return Pose2DEstimate(label="ditch", message=f"no usable edge cluster ({len(edge_points)} edge pts)")
     return best[1]
 
 
