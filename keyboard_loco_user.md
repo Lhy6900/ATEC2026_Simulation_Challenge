@@ -26,12 +26,12 @@ PYTHONPATH=. python scripts/play_atec_task.py --task ATEC-TaskD-G1 --enable_came
 
 | 按键 | 功能 | 行为 |
 |------|------|------|
-| W | 前进 (vx+) | 按住加速，松开衰减 |
-| S | 后退 (vx-) | 按住加速，松开衰减 |
-| A | 右移 (vy+) | 按住加速，松开衰减 |
-| D | 左移 (vy-) | 按住加速，松开衰减 |
-| Q | 右转 (vyaw+) | 按住加速，松开衰减 |
-| E | 左转 (vyaw-) | 按住加速，松开衰减 |
+| W | 前进 (vx+) | 按住跟踪 +0.60，松开衰减 |
+| S | 后退 (vx-) | 按住跟踪 -0.35，松开衰减 |
+| A | 左移 (vy+) | 按住跟踪 +0.35，松开衰减 |
+| D | 右移 (vy-) | 按住跟踪 -0.35，松开衰减 |
+| Q | 左转 (vyaw+) | 按住跟踪 +0.75，松开衰减 |
+| E | 右转 (vyaw-) | 按住跟踪 -0.75，松开衰减 |
 | Z | 身高升高 | 每按一次 +0.02，保持不衰减 |
 | X | 身高降低 | 每按一次 -0.02，保持不衰减 |
 | R | 重置 | 速度归零，身高恢复默认 0.74 |
@@ -40,7 +40,7 @@ PYTHONPATH=. python scripts/play_atec_task.py --task ATEC-TaskD-G1 --enable_came
 
 ## 行为说明
 
-- **速度轴**（WASD / QE）：按住持续加速（0.01/步），到达上限后不再增加；松开后以指数衰减回归 0（每步乘 0.92）
+- **速度轴**（WASD / QE）：每个仿真步轮询 Kit 键盘状态，并保留事件回调兜底；按住会平滑跟踪固定目标速度，松开后衰减回 0
 - **身高**（Z / X）：每次按键调整 0.02，不衰减，停留在设定值（仅 GR00T 策略生效）
 - **重置**（R）：速度归零，身高恢复默认 0.74
 - **策略切换**（B / H）：即时切换，切换后速度从零开始
@@ -54,8 +54,8 @@ keyboard_teleop 提供宽松的上限，各策略内部进一步 clamp：
 
 | 参数 | 键盘上限 | 策略内部上限 |
 |------|----------|-------------|
-| vx | [-1.5, 1.5] | 由 nav_scale × fixed_nav_cmd 控制 |
-| vy | [-1.0, 1.0] | 同上 |
+| vx | [-0.6, 0.8] | 由 nav_scale × fixed_nav_cmd 控制 |
+| vy | [-0.5, 0.5] | 同上 |
 | vyaw | [-1.0, 1.0] | 同上 |
 | height | [0.60, 0.85] | [0.60, 0.85] |
 
@@ -72,15 +72,20 @@ keyboard_teleop 提供宽松的上限，各策略内部进一步 clamp：
 **键盘通用参数** — 编辑 `scripts/keyboard_teleop.py` 顶部：
 
 ```python
-VX_MIN, VX_MAX = -1.5, 1.5    # 键盘层宽松上限
-VY_MIN, VY_MAX = -1.0, 1.0
+VX_MIN, VX_MAX = -0.6, 0.8
+VY_MIN, VY_MAX = -0.5, 0.5
 VYAW_MIN, VYAW_MAX = -1.0, 1.0
 HEIGHT_MIN, HEIGHT_MAX = 0.60, 0.85
 HEIGHT_DEFAULT = 0.74
 HEIGHT_STEP = 0.02
 
-ACCEL_RATE = 0.01   # 每步加速量
-DECAY_RATE = 0.92   # 松开后每步衰减因子
+VX_FORWARD_CMD = 0.6
+VX_BACKWARD_CMD = 0.35
+VY_CMD = 0.35
+VYAW_CMD = 0.75
+
+RESPONSE_RATE = 0.35
+DECAY_RATE = 0.75
 ```
 
 **Blind 策略专用上限** — 编辑 `demo/solution_blind.py`：
@@ -128,7 +133,7 @@ VYAW_MIN, VYAW_MAX = -1.0, 1.0
 | `demo/policy.pt` | Blind locomotion 策略模型 |
 | `demo/GR00T-WholeBodyControl-Balance.onnx` | GR00T balance 策略模型 |
 | `demo/GR00T-WholeBodyControl-Walk.onnx` | GR00T walk 策略模型 |
-| `scripts/keyboard_teleop.py` | 键盘控制器：carb.input 事件订阅、按键计数器追踪、按住加速/松开衰减/身高步进/策略切换 |
+| `scripts/keyboard_teleop.py` | 键盘控制器：carb.input 事件订阅 + 每步按键轮询、目标速度平滑跟踪/松开衰减/身高步进/策略切换 |
 | `scripts/README_keyboard.md` | 键盘控制简要说明 |
 | `keyboard_loco_user.md` | 本文档 |
 

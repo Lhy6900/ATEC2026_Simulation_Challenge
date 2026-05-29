@@ -12,19 +12,19 @@ PYTHONPATH=. python scripts/play_atec_task.py --task ATEC-TaskD-G1 --enable_came
 
 | Key | Action | Range | Behavior |
 |-----|--------|-------|----------|
-| W | Forward (vx +) | [-0.2, 0.5] | Hold to accelerate, release to decay |
-| S | Backward (vx -) | [-0.2, 0.5] | Hold to accelerate, release to decay |
-| A | Left (vy -) | [-0.3, 0.3] | Hold to accelerate, release to decay |
-| D | Right (vy +) | [-0.3, 0.3] | Hold to accelerate, release to decay |
-| Q | Yaw left (vyaw -) | [-0.5, 0.5] | Hold to accelerate, release to decay |
-| E | Yaw right (vyaw +) | [-0.5, 0.5] | Hold to accelerate, release to decay |
+| W | Forward (vx +) | target +0.60 | Hold for target command, release to decay |
+| S | Backward (vx -) | target -0.35 | Hold for target command, release to decay |
+| A | Left (vy +) | target +0.35 | Hold for target command, release to decay |
+| D | Right (vy -) | target -0.35 | Hold for target command, release to decay |
+| Q | Yaw left (vyaw +) | target +0.75 | Hold for target command, release to decay |
+| E | Yaw right (vyaw -) | target -0.75 | Hold for target command, release to decay |
 | Z | Height up | [0.60, 0.85] | Step +0.02 per press, persists |
 | X | Height down | [0.60, 0.85] | Step -0.02 per press, persists |
 | R | Reset all | vx=vy=vyaw=0, height=0.74 | Instant |
 
 ## Behavior Details
 
-- **Velocity axes** (WASD / QE): holding a key continuously increases the command at 0.01/step until the limit is reached; releasing the key decays the command exponentially toward 0 (factor 0.92/step).
+- **Velocity axes** (WASD / QE): movement keys are checked every simulation step with Kit keyboard polling plus event fallback. Holding a key tracks the target command smoothly; releasing the key decays the command toward 0.
 - **Height** (Z / X): each press adjusts by 0.02. Height does not decay — it stays where you set it.
 - **Reset** (R): instantly zeros all velocity commands and restores height to 0.74.
 - When keyboard mode is active, the automatic navigation ramp-up is disabled — you have full control.
