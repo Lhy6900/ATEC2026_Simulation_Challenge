@@ -7,6 +7,7 @@ import os
 import time
 import json
 import sys
+import numpy as np
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -87,6 +88,12 @@ parser.add_argument(
     default=2.0,
     help="Write box/ditch LiDAR-relative pose estimates every N wall-clock seconds.",
 )
+parser.add_argument(
+    "--lidar_pose_gt_log",
+    type=str,
+    default="",
+    help="Optional dev CSV with LiDAR estimates and config-derived ground truth for Task D.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -145,9 +152,12 @@ from rl_utils import camera_follow
 from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
 from keyboard_teleop import KeyboardTeleop
 from lidar_perception import (
+    align_axis_yaw_to_reference,
     build_task_d_lidar_prior,
     estimate_task_d_poses_from_lidar,
     LidarPoseStabilizer,
+    quat_inverse_apply,
+    yaw_from_quat_wxyz,
 )
 from sensor_vis_utils import (
     depth_to_world_points,
@@ -231,6 +241,187 @@ class LidarPoseLogger:
             f"{prefix}_yaw_deg": f"{math.degrees(estimate.yaw):.3f}",
             f"{prefix}_conf": f"{estimate.confidence:.3f}",
         }
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+            self._writer = None
+
+
+class LidarPoseGroundTruthLogger:
+    """Write LiDAR-frame estimates against Task D ground truth for offline tuning."""
+
+    _FIELDS = (
+        "wall_time_s",
+        "sim_time_s",
+        "step",
+        "box_valid",
+        "box_x_m",
+        "box_y_m",
+        "box_yaw_deg",
+        "box_gt_x_m",
+        "box_gt_y_m",
+        "box_gt_yaw_deg",
+        "box_err_xy_m",
+        "box_err_yaw_deg",
+        "ditch_valid",
+        "ditch_x_m",
+        "ditch_y_m",
+        "ditch_yaw_deg",
+        "ditch_gt_x_m",
+        "ditch_gt_y_m",
+        "ditch_gt_yaw_deg",
+        "ditch_err_xy_m",
+        "ditch_err_yaw_deg",
+    )
+
+    def __init__(self, path: str | None, interval_s: float, env, lidar_prior):
+        self.path = os.path.abspath(path) if path else ""
+        self.interval_s = max(0.0, float(interval_s))
+        self.env = env
+        self.lidar_prior = lidar_prior
+        self._file = None
+        self._writer = None
+        self._last_log_wall_time = None
+        self._start_wall_time = time.time()
+        if not self.path:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._file = open(self.path, "w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
+        self._writer.writeheader()
+        self._file.flush()
+        print(f"[lidar_pose_gt_log] Writing estimate/ground-truth poses every {self.interval_s:.1f}s to {self.path}")
+
+    def maybe_write(self, result, step: int, sim_time_s: float | None = None) -> None:
+        if self._writer is None or result is None:
+            return
+        wall_time_s = time.time() - self._start_wall_time
+        if self._last_log_wall_time is not None and wall_time_s - self._last_log_wall_time < self.interval_s:
+            return
+        gt = self._get_ground_truth()
+        if gt is None:
+            return
+        self._last_log_wall_time = wall_time_s
+        row = {
+            "wall_time_s": f"{wall_time_s:.3f}",
+            "sim_time_s": f"{float(sim_time_s):.3f}" if sim_time_s is not None else "",
+            "step": int(step),
+        }
+        row.update(self._pose_gt_fields("box", result.box, gt["box"]))
+        row.update(self._pose_gt_fields("ditch", result.ditch, gt["ditch"]))
+        self._writer.writerow(row)
+        self._file.flush()
+
+    def _get_ground_truth(self):
+        scene = getattr(getattr(self.env, "unwrapped", self.env), "scene", None)
+        if scene is None:
+            return None
+        sensors = getattr(scene, "sensors", {})
+        lidar_sensor = sensors.get("lidar_sensor") if hasattr(sensors, "get") else None
+        lidar_data = getattr(lidar_sensor, "data", None)
+        lidar_pos = self._first_array(getattr(lidar_data, "pos_w", None), 3)
+        lidar_quat = self._first_array(getattr(lidar_data, "quat_w", None), 4)
+        if lidar_pos is None or lidar_quat is None:
+            return None
+
+        box_pose = self._box_ground_truth(scene, lidar_pos, lidar_quat)
+        ditch_pose = self._ditch_ground_truth(scene, lidar_pos, lidar_quat)
+        if box_pose is None or ditch_pose is None:
+            return None
+        return {"box": box_pose, "ditch": ditch_pose}
+
+    def _box_ground_truth(self, scene, lidar_pos, lidar_quat):
+        try:
+            box = scene["box"]
+        except Exception:
+            return None
+        box_pos = self._first_array(getattr(box.data, "root_pos_w", None), 3)
+        box_quat = self._first_array(getattr(box.data, "root_quat_w", None), 4)
+        if box_pos is None or box_quat is None:
+            return None
+        return self._world_pose_to_lidar_pose(box_pos, yaw_from_quat_wxyz(box_quat) + math.pi / 2.0, lidar_pos, lidar_quat)
+
+    def _ditch_ground_truth(self, scene, lidar_pos, lidar_quat):
+        env_origin = self._first_array(getattr(scene, "env_origins", None), 3)
+        if env_origin is None:
+            env_origin = np.zeros(3, dtype=np.float32)
+        terrain = getattr(scene, "terrain", None)
+        terrain_generator = getattr(terrain, "terrain_generator", None)
+        cfg = getattr(terrain_generator, "cfg", None)
+        size = getattr(cfg, "size", (12.0, 8.0))
+        pit_cfg = None
+        sub_terrains = getattr(cfg, "sub_terrains", {}) if cfg is not None else {}
+        if hasattr(sub_terrains, "get"):
+            pit_cfg = sub_terrains.get("pit_and_platform")
+        border_width = float(getattr(pit_cfg, "border_width", 1.0)) if pit_cfg is not None else 1.0
+        platform_center_y = float(size[1]) * 0.75
+        platform_extent_y = float(size[1]) * 0.5 - border_width
+        pit_min_y = 0.5 * border_width
+        platform_min_y = platform_center_y - 0.5 * platform_extent_y
+        open_ditch_center_y = 0.5 * (pit_min_y + platform_min_y)
+        terrain_origin_y = float(size[1]) * 0.5
+        center_local = np.array(
+            [
+                float(size[0]) * 0.5 - float(size[0]) * 0.15,
+                open_ditch_center_y - terrain_origin_y,
+                -0.5 * float(self.lidar_prior.ditch.depth),
+            ],
+            dtype=np.float32,
+        )
+        center_w = env_origin + center_local
+        return self._world_pose_to_lidar_pose(center_w, math.pi / 2.0, lidar_pos, lidar_quat)
+
+    def _world_pose_to_lidar_pose(self, pos_w, yaw_w, lidar_pos, lidar_quat):
+        rel_xyz = quat_inverse_apply(lidar_quat, (pos_w - lidar_pos).reshape(1, 3))[0]
+        yaw_l = align_axis_yaw_to_reference(float(yaw_w) - yaw_from_quat_wxyz(lidar_quat), math.pi / 2.0)
+        return float(rel_xyz[0]), float(rel_xyz[1]), float(yaw_l)
+
+    def _pose_gt_fields(self, prefix: str, estimate, gt_pose) -> dict[str, str | int]:
+        gt_x, gt_y, gt_yaw = gt_pose
+        fields = {
+            f"{prefix}_gt_x_m": f"{gt_x:.4f}",
+            f"{prefix}_gt_y_m": f"{gt_y:.4f}",
+            f"{prefix}_gt_yaw_deg": f"{math.degrees(gt_yaw):.3f}",
+        }
+        if estimate is None or not estimate.valid:
+            fields.update(
+                {
+                    f"{prefix}_valid": 0,
+                    f"{prefix}_x_m": "",
+                    f"{prefix}_y_m": "",
+                    f"{prefix}_yaw_deg": "",
+                    f"{prefix}_err_xy_m": "",
+                    f"{prefix}_err_yaw_deg": "",
+                }
+            )
+            return fields
+        err_xy = math.hypot(float(estimate.x) - gt_x, float(estimate.y) - gt_y)
+        err_yaw = abs(align_axis_yaw_to_reference(float(estimate.yaw), gt_yaw) - gt_yaw)
+        fields.update(
+            {
+                f"{prefix}_valid": 1,
+                f"{prefix}_x_m": f"{estimate.x:.4f}",
+                f"{prefix}_y_m": f"{estimate.y:.4f}",
+                f"{prefix}_yaw_deg": f"{math.degrees(estimate.yaw):.3f}",
+                f"{prefix}_err_xy_m": f"{err_xy:.4f}",
+                f"{prefix}_err_yaw_deg": f"{math.degrees(err_yaw):.3f}",
+            }
+        )
+        return fields
+
+    @staticmethod
+    def _first_array(value, size: int):
+        if value is None:
+            return None
+        array = value.detach().cpu().numpy() if hasattr(value, "detach") else value
+        array = np.asarray(array, dtype=np.float32)
+        if array.ndim == 2:
+            array = array[0]
+        if array.shape[0] < size:
+            return None
+        return array[:size].copy()
 
     def close(self) -> None:
         if self._file is not None:
@@ -459,6 +650,7 @@ class SensorSceneMarkers:
         interval: int,
         lidar_prior=None,
         lidar_pose_logger: LidarPoseLogger | None = None,
+        lidar_pose_gt_logger: LidarPoseGroundTruthLogger | None = None,
     ):
         self.env = env
         self.enabled = enabled
@@ -469,6 +661,7 @@ class SensorSceneMarkers:
         self.lidar_prior = lidar_prior
         self.lidar_pose_stabilizer = LidarPoseStabilizer()
         self.lidar_pose_logger = lidar_pose_logger
+        self.lidar_pose_gt_logger = lidar_pose_gt_logger
         self._depth_marker = None
         self._lidar_marker = None
         self._disabled_reason = None
@@ -597,6 +790,8 @@ class SensorSceneMarkers:
             )
             if self.lidar_pose_logger is not None:
                 self.lidar_pose_logger.maybe_write(lidar_pose_result, timestep, sim_time_s)
+            if self.lidar_pose_gt_logger is not None:
+                self.lidar_pose_gt_logger.maybe_write(lidar_pose_result, timestep, sim_time_s)
         else:
             ray_directions = getattr(lidar_sensor, "ray_directions", None)
             sensor_quat_w = getattr(lidar_data, "quat_w", None)
@@ -625,7 +820,7 @@ class SensorSceneMarkers:
             prior=self.lidar_prior,
             max_distance=max_distance,
         )
-        return self.lidar_pose_stabilizer.update(result)
+        return self.lidar_pose_stabilizer.update(result, sensor_pos_w, sensor_quat_w)
 
     def _build_pose_report(self) -> str | None:
         scene = self._get_scene()
@@ -738,6 +933,12 @@ def play() -> tuple[float, float]:
         args_cli.lidar_pose_log if args_cli.sensor_vis else "",
         args_cli.lidar_pose_log_interval,
     )
+    lidar_pose_gt_logger = LidarPoseGroundTruthLogger(
+        args_cli.lidar_pose_gt_log if args_cli.sensor_vis else "",
+        args_cli.lidar_pose_log_interval,
+        env,
+        lidar_prior,
+    )
     sensor_scene_markers = SensorSceneMarkers(
         env,
         enabled=args_cli.sensor_vis,
@@ -745,6 +946,7 @@ def play() -> tuple[float, float]:
         interval=args_cli.sensor_vis_interval,
         lidar_prior=lidar_prior,
         lidar_pose_logger=lidar_pose_logger,
+        lidar_pose_gt_logger=lidar_pose_gt_logger,
     )
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
@@ -818,6 +1020,7 @@ def play() -> tuple[float, float]:
 
     sensor_scene_markers.close()
     lidar_pose_logger.close()
+    lidar_pose_gt_logger.close()
     render_sync_hook.close()
     env.close()
     if teleop is not None:
