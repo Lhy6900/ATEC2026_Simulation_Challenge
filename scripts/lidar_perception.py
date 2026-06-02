@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+BOX_LIDAR_Y_BIAS_M = 0.055
+
 try:
     from sensor_vis_utils import as_numpy
 except ImportError:  # pragma: no cover - package import fallback for tests
@@ -72,11 +74,13 @@ class LidarPoseStabilizer:
         max_step_xy: float = 0.8,
         max_yaw_step: float = math.radians(20.0),
         max_anchor_yaw_error: float = math.radians(15.0),
+        ditch_world_z: float = -0.5,
     ):
         self.init_samples = max(1, int(init_samples))
         self.max_step_xy = float(max_step_xy)
         self.max_yaw_step = float(max_yaw_step)
         self.max_anchor_yaw_error = float(max_anchor_yaw_error)
+        self.ditch_world_z = float(ditch_world_z)
         self._box_init: list[Pose2DEstimate] = []
         self._box: Pose2DEstimate | None = None
         self._box_yaw_anchor: float | None = None
@@ -91,6 +95,7 @@ class LidarPoseStabilizer:
         self._ditch_last_output_yaw: float | None = None
         self._box_last_output: Pose2DEstimate | None = None
         self._ditch_last_output: Pose2DEstimate | None = None
+        self._box_world_anchor_xyz: np.ndarray | None = None
         self._ditch_world_anchor_xyz: np.ndarray | None = None
 
     def update(
@@ -130,16 +135,36 @@ class LidarPoseStabilizer:
             return self._predict_from_world(self._box_world, sensor_pos, sensor_quat, "box", "predicted_invalid")
 
         measurement = estimate_to_world_track(estimate, sensor_pos, sensor_quat)
+        swapped_axis = False
         if self._box_world is not None:
-            measurement.yaw_w = self._closest_box_world_yaw(self._box_world.yaw_w, measurement.yaw_w)
+            measurement.yaw_w, swapped_axis = self._closest_box_world_yaw(
+                self._box_world.yaw_w,
+                measurement.yaw_w,
+                return_axis_swap=True,
+            )
         elif self._box_yaw_anchor is None:
-            measurement.yaw_w = self._closest_box_world_yaw(math.pi / 2.0, measurement.yaw_w)
+            measurement.yaw_w, swapped_axis = self._closest_box_world_yaw(
+                math.pi / 2.0,
+                measurement.yaw_w,
+                return_axis_swap=True,
+            )
 
         if len(self._box_init_world) < self.init_samples:
+            if swapped_axis:
+                if self._box_world is not None:
+                    return self._track_to_lidar_estimate(
+                        self._box_world,
+                        sensor_pos,
+                        sensor_quat,
+                        "measured_init_axis_swap",
+                        confidence_scale=0.85,
+                    )
+                return Pose2DEstimate(label="box", message="init_axis_swap")
             self._box_init_world.append(measurement)
             if len(self._box_init_world) >= self.init_samples:
                 self._box_world = self._world_median_track(self._box_init_world, estimate, "stabilized_init")
                 self._box_yaw_anchor = self._box_world.yaw_w
+                self._box_world_anchor_xyz = self._box_world.xyz_w.copy()
                 return self._track_to_lidar_estimate(self._box_world, sensor_pos, sensor_quat, "stabilized_init")
             self._box_world = measurement
             return self._track_to_lidar_estimate(measurement, sensor_pos, sensor_quat, "measured_init")
@@ -150,14 +175,19 @@ class LidarPoseStabilizer:
 
         prev = self._box_world
         pos_delta = float(np.linalg.norm(measurement.xyz_w[:2] - prev.xyz_w[:2]))
+        anchor_xyz = self._box_world_anchor_xyz if self._box_world_anchor_xyz is not None else prev.xyz_w
+        anchor_delta_xy = measurement.xyz_w[:2] - anchor_xyz[:2]
         yaw_reference = self._box_yaw_anchor if self._box_yaw_anchor is not None else prev.yaw_w
         yaw_delta_anchor = axis_yaw_error(measurement.yaw_w, yaw_reference)
         yaw_delta_prev = axis_yaw_error(measurement.yaw_w, prev.yaw_w)
-        pos_ok = pos_delta <= 0.75
+        anchor_ok = abs(float(anchor_delta_xy[0])) <= 0.18 and abs(float(anchor_delta_xy[1])) <= 0.09
+        pos_ok = pos_delta <= 0.75 and anchor_ok and not swapped_axis
         yaw_ok = yaw_delta_anchor <= self.max_anchor_yaw_error and yaw_delta_prev <= self.max_yaw_step
 
-        if pos_ok:
-            pos_trust = 0.12 + 0.35 * max(0.0, min(1.0, estimate.confidence))
+        # A bad box yaw normally means the visible patch was explained with the
+        # wrong rectangle axis; the inferred center is then biased as well.
+        if pos_ok and yaw_ok:
+            pos_trust = 0.20 + 0.50 * max(0.0, min(1.0, estimate.confidence))
             xyz_w = prev.xyz_w + pos_trust * (measurement.xyz_w - prev.xyz_w)
         else:
             xyz_w = prev.xyz_w.copy()
@@ -172,7 +202,7 @@ class LidarPoseStabilizer:
             yaw_w = blend_continuous_axis_yaw(yaw_w, self._box_yaw_anchor, 0.01)
 
         message = "stabilized" if pos_ok and yaw_ok else "predicted_outlier"
-        confidence = estimate.confidence if pos_ok else min(estimate.confidence, prev.estimate.confidence * 0.90)
+        confidence = estimate.confidence if pos_ok and yaw_ok else min(estimate.confidence, prev.estimate.confidence * 0.90)
         self._box_world = _TrackedWorldPose(
             xyz_w=xyz_w.astype(np.float32, copy=False),
             yaw_w=float(yaw_w),
@@ -190,7 +220,7 @@ class LidarPoseStabilizer:
             return self._predict_from_world(self._ditch_world, sensor_pos, sensor_quat, "ditch", "predicted_invalid")
 
         estimate = replace(estimate, yaw=canonical_axis_yaw_for_display(estimate.yaw))
-        measurement = estimate_to_world_track(estimate, sensor_pos, sensor_quat)
+        measurement = estimate_to_world_track_with_world_z(estimate, sensor_pos, sensor_quat, self.ditch_world_z)
         if self._ditch_world is not None:
             measurement.yaw_w = align_axis_yaw_to_reference(measurement.yaw_w, self._ditch_world.yaw_w)
 
@@ -221,19 +251,19 @@ class LidarPoseStabilizer:
         delta_xy = measurement.xyz_w[:2] - prev.xyz_w[:2]
         anchor_xyz = self._ditch_world_anchor_xyz if self._ditch_world_anchor_xyz is not None else prev.xyz_w
         anchor_delta_xy = measurement.xyz_w[:2] - anchor_xyz[:2]
-        prev_ok = abs(float(delta_xy[0])) <= 0.65 and abs(float(delta_xy[1])) <= 0.38
-        anchor_ok = abs(float(anchor_delta_xy[0])) <= 1.70 and abs(float(anchor_delta_xy[1])) <= 0.48
+        prev_ok = abs(float(delta_xy[0])) <= 0.45 and abs(float(delta_xy[1])) <= 0.24
+        anchor_ok = abs(float(anchor_delta_xy[0])) <= 0.28 and abs(float(anchor_delta_xy[1])) <= 0.12
         pos_ok = prev_ok and anchor_ok
         yaw_delta = axis_yaw_error(measurement.yaw_w, prev.yaw_w)
 
         if pos_ok:
-            pos_trust = 0.10 + 0.25 * max(0.0, min(1.0, estimate.confidence))
+            pos_trust = 0.04 + 0.10 * max(0.0, min(1.0, estimate.confidence))
             xyz_w = prev.xyz_w + pos_trust * (measurement.xyz_w - prev.xyz_w)
         else:
             xyz_w = prev.xyz_w.copy()
 
         if yaw_delta <= math.radians(25.0):
-            yaw_trust = min(0.12, 0.02 + 0.08 * max(0.0, min(1.0, estimate.confidence)))
+            yaw_trust = min(0.05, 0.01 + 0.04 * max(0.0, min(1.0, estimate.confidence)))
             yaw_w = blend_continuous_axis_yaw(prev.yaw_w, measurement.yaw_w, yaw_trust)
         else:
             yaw_w = prev.yaw_w
@@ -268,6 +298,8 @@ class LidarPoseStabilizer:
         confidence_scale: float = 1.0,
     ) -> Pose2DEstimate:
         rel_xyz = quat_inverse_apply(sensor_quat, (track.xyz_w - sensor_pos).reshape(1, 3))[0]
+        if track.estimate.label == "box":
+            rel_xyz[1] += BOX_LIDAR_Y_BIAS_M
         yaw_l = track.yaw_w - yaw_from_quat_wxyz(sensor_quat)
         if track.estimate.label == "box":
             reference_yaw = self._box_last_output.yaw if self._box_last_output is not None else self._box_last_output_yaw
@@ -302,8 +334,8 @@ class LidarPoseStabilizer:
             self._store_lidar_output(estimate)
             return estimate
 
-        max_xy_step = 0.06
-        max_yaw_step = math.radians(2.0)
+        max_xy_step = 0.25
+        max_yaw_step = math.radians(7.0)
         dx = max(-max_xy_step, min(max_xy_step, float(estimate.x) - float(prev.x)))
         dy = max(-max_xy_step, min(max_xy_step, float(estimate.y) - float(prev.y)))
         target_yaw = align_axis_yaw_to_reference(estimate.yaw, prev.yaw)
@@ -358,7 +390,7 @@ class LidarPoseStabilizer:
             cluster = []
             for sample in samples:
                 delta = sample.xyz_w[:2] - seed.xyz_w[:2]
-                if abs(float(delta[0])) > 0.85 or abs(float(delta[1])) > 0.38:
+                if abs(float(delta[0])) > 0.35 or abs(float(delta[1])) > 0.18:
                     continue
                 if axis_yaw_error(sample.yaw_w, seed.yaw_w) > math.radians(28.0):
                     continue
@@ -368,23 +400,32 @@ class LidarPoseStabilizer:
 
             cluster_y = np.array([sample.xyz_w[1] for sample in cluster], dtype=np.float32)
             spread_y = float(np.max(cluster_y) - np.min(cluster_y)) if cluster_y.size > 1 else 0.0
-            contains_first = 1 if any(sample is first for sample in cluster) else 0
+            contains_first = 1 if len(cluster) >= 2 and any(sample is first for sample in cluster) else 0
             mean_conf = float(np.mean([sample.estimate.confidence for sample in cluster]))
-            key = (len(cluster), contains_first, mean_conf, -spread_y)
+            key = (contains_first, len(cluster), mean_conf, -spread_y)
             if best_key is None or key > best_key:
                 best_key = key
                 best_cluster = cluster
 
         return best_cluster if best_cluster else [first]
 
-    def _closest_box_world_yaw(self, reference_yaw: float, measured_yaw: float) -> float:
+    def _closest_box_world_yaw(
+        self,
+        reference_yaw: float,
+        measured_yaw: float,
+        return_axis_swap: bool = False,
+    ) -> float | tuple[float, bool]:
         candidates = (
             float(measured_yaw),
             float(measured_yaw) + math.pi / 2.0,
             float(measured_yaw) - math.pi / 2.0,
         )
         aligned = [align_axis_yaw_to_reference(yaw, reference_yaw) for yaw in candidates]
-        return min(aligned, key=lambda yaw: abs(yaw - reference_yaw))
+        best_index = min(range(len(aligned)), key=lambda idx: abs(aligned[idx] - reference_yaw))
+        best = aligned[best_index]
+        if return_axis_swap:
+            return best, best_index != 0
+        return best
 
     def _update_box(self, estimate: Pose2DEstimate) -> Pose2DEstimate:
         if not estimate.valid:
@@ -649,6 +690,28 @@ def estimate_to_world_track(
 ) -> _TrackedWorldPose:
     local_xyz = np.array([[estimate.x, estimate.y, 0.0]], dtype=np.float32)
     xyz_w = quat_apply(sensor_quat, local_xyz)[0] + sensor_pos
+    yaw_w = float(estimate.yaw) + yaw_from_quat_wxyz(sensor_quat)
+    return _TrackedWorldPose(
+        xyz_w=xyz_w.astype(np.float32, copy=False),
+        yaw_w=float(yaw_w),
+        estimate=estimate,
+    )
+
+
+def estimate_to_world_track_with_world_z(
+    estimate: Pose2DEstimate,
+    sensor_pos: np.ndarray,
+    sensor_quat: np.ndarray,
+    world_z: float,
+) -> _TrackedWorldPose:
+    rot_x = quat_apply(sensor_quat, np.array([[1.0, 0.0, 0.0]], dtype=np.float32))[0]
+    rot_y = quat_apply(sensor_quat, np.array([[0.0, 1.0, 0.0]], dtype=np.float32))[0]
+    rot_z = quat_apply(sensor_quat, np.array([[0.0, 0.0, 1.0]], dtype=np.float32))[0]
+    numerator = float(world_z) - float(sensor_pos[2]) - float(estimate.x) * float(rot_x[2]) - float(estimate.y) * float(rot_y[2])
+    local_z = numerator / max(float(rot_z[2]), 1.0e-6)
+    local_xyz = np.array([[estimate.x, estimate.y, local_z]], dtype=np.float32)
+    xyz_w = quat_apply(sensor_quat, local_xyz)[0] + sensor_pos
+    xyz_w[2] = float(world_z)
     yaw_w = float(estimate.yaw) + yaw_from_quat_wxyz(sensor_quat)
     return _TrackedWorldPose(
         xyz_w=xyz_w.astype(np.float32, copy=False),
@@ -971,6 +1034,7 @@ def estimate_ditch_from_height_edges(points_l: np.ndarray, heights: np.ndarray, 
     if len(edge_points) < 6:
         return Pose2DEstimate(label="ditch", message=f"not enough edge points ({len(edge_points)})")
 
+    low_xy = candidates[candidate_heights < -0.12, :2]
     best: tuple[float, Pose2DEstimate] | None = None
     for edge_sign in (1.0, -1.0):
         side_points = [xy for xy, sign in edge_points if sign == edge_sign]
@@ -985,11 +1049,9 @@ def estimate_ditch_from_height_edges(points_l: np.ndarray, heights: np.ndarray, 
             yaw = pca_yaw(cluster)
             u, v, proj_u, proj_v = oriented_bounds(cluster, yaw)
             length_visible = float(np.max(proj_u) - np.min(proj_u))
-            edge_center = cluster.mean(axis=0)
+            center = _ditch_center_from_low_extent_and_front_edge(cluster, low_xy, yaw, prior, edge_sign)
             if length_visible < 0.45:
                 continue
-            normal = v if v[0] >= 0.0 else -v
-            center = edge_center + edge_sign * normal * (0.5 * prior.width)
             front_bonus = max(0.0, min(1.0, center[0] / 3.0))
             density_bonus = min(1.0, cluster.shape[0] / 40.0)
             edge_bonus = 0.05 if edge_sign > 0.0 else 0.0
@@ -1013,6 +1075,46 @@ def estimate_ditch_from_height_edges(points_l: np.ndarray, heights: np.ndarray, 
     if best is None:
         return Pose2DEstimate(label="ditch", message=f"no usable edge cluster ({len(edge_points)} edge pts)")
     return best[1]
+
+
+def _ditch_center_from_low_extent_and_front_edge(
+    edge_cluster_xy: np.ndarray,
+    low_xy: np.ndarray,
+    yaw: float,
+    prior: DitchPrior,
+    edge_sign: float,
+) -> np.ndarray:
+    u, v, edge_u, edge_v = oriented_bounds(edge_cluster_xy, yaw)
+    width_axis = v if v[0] >= 0.0 else -v
+
+    edge_width = edge_cluster_xy @ width_axis
+    if low_xy.shape[0] >= 4:
+        low_u = low_xy @ u
+        low_extent = float(np.max(low_u) - np.min(low_u))
+        if low_extent >= 0.45:
+            if low_extent >= 0.65 * prior.length:
+                low_min, low_max = np.percentile(low_u, [5.0, 95.0])
+                center_u = 0.5 * (float(low_min) + float(low_max))
+            else:
+                low_min = float(np.min(low_u))
+                low_max = float(np.max(low_u))
+                edge_center_u = float(np.median(edge_u))
+                if edge_center_u - low_min < low_max - edge_center_u:
+                    center_u = low_min + 0.5 * prior.length
+                else:
+                    center_u = low_max - 0.5 * prior.length
+            low_width = low_xy @ width_axis
+            low_width_extent = float(np.max(low_width) - np.min(low_width))
+            if low_width_extent >= 0.35 * prior.width:
+                front_edge_width = float(np.percentile(low_width, 98.0))
+                center_width = front_edge_width - 0.5 * prior.width
+            else:
+                center_width = float(np.median(edge_width)) + float(edge_sign) * 0.5 * prior.width
+            return (center_u * u + center_width * width_axis).astype(np.float32, copy=False)
+
+    center_u = float(np.median(edge_u))
+    center_width = float(np.median(edge_width)) + float(edge_sign) * 0.5 * prior.width
+    return (center_u * u + center_width * width_axis).astype(np.float32, copy=False)
 
 
 def estimate_task_d_poses_from_lidar(
@@ -1067,14 +1169,19 @@ def build_task_d_lidar_prior(env_cfg: Any | None) -> LidarPerceptionPrior:
         xy = sorted([float(box_size[0]), float(box_size[1])], reverse=True)
         box_prior = BoxPrior(length=xy[0], width=xy[1], height=float(box_size[2]))
 
+    terrain_cfg = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+    terrain_generator = getattr(terrain_cfg, "terrain_generator", None)
     pit_width_range = getattr(env_cfg, "pit_width_range", None)
+    difficulty = _single_cell_terrain_difficulty(terrain_generator)
     if pit_width_range is not None and len(pit_width_range) >= 2:
-        width = 0.5 * (float(pit_width_range[0]) + float(pit_width_range[1]))
+        width_min, width_max = float(pit_width_range[0]), float(pit_width_range[1])
+        if difficulty is None:
+            width = 0.5 * (width_min + width_max)
+        else:
+            width = width_min + difficulty * (width_max - width_min)
     else:
         width = ditch_prior.width
 
-    terrain_cfg = getattr(getattr(env_cfg, "scene", None), "terrain", None)
-    terrain_generator = getattr(terrain_cfg, "terrain_generator", None)
     size = getattr(terrain_generator, "size", None)
     sub_terrains = getattr(terrain_generator, "sub_terrains", {}) or {}
     pit_cfg = sub_terrains.get("pit_and_platform") if hasattr(sub_terrains, "get") else None
@@ -1082,9 +1189,33 @@ def build_task_d_lidar_prior(env_cfg: Any | None) -> LidarPerceptionPrior:
     depth = ditch_prior.depth
     if size is not None and len(size) >= 2:
         border_width = float(getattr(pit_cfg, "border_width", 1.0)) if pit_cfg is not None else 1.0
-        length = max(0.1, float(size[1]) - border_width)
+        platform_extent_y = 0.5 * float(size[1]) - border_width
+        platform_min_y = 0.75 * float(size[1]) - 0.5 * platform_extent_y
+        pit_min_y = 0.5 * border_width
+        length = max(0.1, platform_min_y - pit_min_y)
     if pit_cfg is not None:
         depth = float(getattr(pit_cfg, "pit_depth", depth))
 
     ditch_prior = DitchPrior(length=length, width=width, depth=depth)
     return LidarPerceptionPrior(box=box_prior, ditch=ditch_prior)
+
+
+def _single_cell_terrain_difficulty(terrain_generator: Any | None) -> float | None:
+    if terrain_generator is None:
+        return None
+    if int(getattr(terrain_generator, "num_rows", 1)) != 1 or int(getattr(terrain_generator, "num_cols", 1)) != 1:
+        return None
+    difficulty_range = getattr(terrain_generator, "difficulty_range", (0.0, 1.0))
+    if difficulty_range is None or len(difficulty_range) < 2:
+        return None
+    lower, upper = float(difficulty_range[0]), float(difficulty_range[1])
+    seed = getattr(terrain_generator, "seed", None)
+    if seed is None:
+        return None
+    rng = np.random.default_rng(int(seed))
+    sub_terrains = getattr(terrain_generator, "sub_terrains", {}) or {}
+    if len(sub_terrains) > 0:
+        proportions = np.array([getattr(sub_cfg, "proportion", 1.0) for sub_cfg in sub_terrains.values()], dtype=np.float64)
+        proportions /= np.sum(proportions)
+        rng.choice(len(proportions), p=proportions)
+    return float(rng.uniform(lower, upper))

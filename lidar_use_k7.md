@@ -93,3 +93,18 @@ yaw: 沟壑长度方向相对 LiDAR +x 的角度
 - `+90deg` 和 `-90deg` 属于同一条无向轴，但日志会按历史连续分支输出，避免 180deg 假跳变。
 
 `conf` 是几何置信度，不是概率；越高表示尺寸、点数和形状越匹配当前先验。
+
+6月2日补充：
+
+  验证结果，TaskD-G1 seed 0/1/2/3 短程 GT 全部达标，没有超阈值行：
+
+  seed0: box max_x 0.0472 max_y 0.0480 max_yaw 0.1198 | ditch max_x 0.0808 max_y 0.0907 max_yaw 0.0424
+  seed1: box max_x 0.0588 max_y 0.0531 max_yaw 0.1508 | ditch max_x 0.0302 max_y 0.0761 max_yaw 0.0517
+  seed2: box max_x 0.0491 max_y 0.0577 max_yaw 0.1327 | ditch max_x 0.0476 max_y 0.0692 max_yaw 0.0342
+  seed3: box max_x 0.0267 max_y 0.0484 max_yaw 0.1005 | ditch max_x 0.0497 max_y 0.0750 max_yaw 0.0342
+
+  单元测试也重新跑过：40 tests OK。
+
+  正常 GUI 测试命令还是：
+
+  PYTHONPATH=. python scripts/play_atec_task.py --task ATEC-TaskD-G1 --enable_cameras --keyboard --debug --sensor_vis
