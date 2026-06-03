@@ -108,3 +108,15 @@ yaw: 沟壑长度方向相对 LiDAR +x 的角度
   正常 GUI 测试命令还是：
 
   PYTHONPATH=. python scripts/play_atec_task.py --task ATEC-TaskD-G1 --enable_cameras --keyboard --debug --sensor_vis
+
+6月3日补充：
+
+  近距离箱子验证可以用调试参数把箱子移动到 LiDAR 坐标系下的指定位置：
+
+  PYTHONPATH=. python scripts/play_atec_task.py --task ATEC-TaskD-G1 --headless --device cuda:0 --debug_lidar_gpu_probe --debug_zero_actions --disable_image_obs --debug_box_pose_lidar 0.70 0.25 30 --max_steps 70
+
+  箱子近距离识别现在会过滤退化边、重复帧和明显错轴 yaw；启动期用多帧候选聚类，初始化后用 yaw 锚点和 20deg 门控拒绝跳变。实测把箱子放在 LiDAR 坐标 `(0.70, 0.25, 30deg)` 时，稳定输出约为 `(0.77, 0.17, 26.8deg)`，首个有效输出误差约 `0.106m / 3.2deg`。
+
+  GPU 并行正式入口在 `demo.solution.get_lidar_perception(num_envs, device="cuda")`，核心实现在 `demo/lidar_perception.py` 和 `demo/lidar_perception_torch.py`。点云变换、地面拟合、box/ditch 估计和时间稳定器都保持 batched torch tensor，正式 GPU 路径不使用 `.cpu()` / `.numpy()` / `.item()`，输出形状为 `(num_envs, 3)`。
+
+  已在本机 `cuda:0` 上用 `num_envs=2` probe 验证并行输出 `shape=(2, 3)`；近距离箱子 raw 结果即使出现 `+60deg/+75deg/+-80deg` 等错轴解释，稳定输出也会保持在正确 yaw 附近，不再出现 2s 日志内的大幅跳变。

@@ -22,6 +22,12 @@ parser = argparse.ArgumentParser(description="Play Atec Tasks (ENV only, no RL).
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=0,
+    help="Optional play-loop step limit for local debugging. Set 0 to run until done.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
@@ -100,6 +106,32 @@ parser.add_argument(
     default=None,
     help="Optional random seed for reproducible local play/debug runs.",
 )
+parser.add_argument(
+    "--debug_box_pose_lidar",
+    type=float,
+    nargs=3,
+    metavar=("X", "Y", "YAW_DEG"),
+    default=None,
+    help="Dev-only: place Task D box at a LiDAR-relative pose after reset for perception validation.",
+)
+parser.add_argument(
+    "--debug_lidar_gpu_probe",
+    action="store_true",
+    default=False,
+    help="Dev-only: run demo Task D GPU LiDAR perception from env scene tensors and print one sample.",
+)
+parser.add_argument(
+    "--disable_image_obs",
+    action="store_true",
+    default=False,
+    help="Dev-only: disable camera sensors/image observations before env creation for LiDAR-only GPU runs.",
+)
+parser.add_argument(
+    "--debug_zero_actions",
+    action="store_true",
+    default=False,
+    help="Dev-only: step the env with zero actions instead of the policy, useful for sensor/GPU probes.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -163,6 +195,7 @@ from isaaclab_tasks.utils import parse_env_cfg
 from rl_utils import camera_follow
 from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
 from keyboard_teleop import KeyboardTeleop
+from scripts.play_config_utils import disable_camera_observations, make_zero_actions, tensor_any_bool, tensor_mean_float
 from lidar_perception import (
     align_axis_yaw_to_reference,
     build_task_d_lidar_prior,
@@ -957,6 +990,46 @@ class SensorSceneMarkers:
         return "pose " + " ".join(parts) if parts else None
 
 
+def place_task_d_box_relative_to_lidar(env, x_m: float, y_m: float, yaw_deg: float) -> bool:
+    scene = getattr(getattr(env, "unwrapped", env), "scene", None)
+    if scene is None:
+        return False
+    sensors = getattr(scene, "sensors", {})
+    lidar_sensor = sensors.get("lidar_sensor") if hasattr(sensors, "get") else None
+    lidar_data = getattr(lidar_sensor, "data", None)
+    lidar_pos = getattr(lidar_data, "pos_w", None)
+    lidar_quat = getattr(lidar_data, "quat_w", None)
+    if lidar_pos is None or lidar_quat is None:
+        return False
+    try:
+        box = scene["box"]
+    except Exception:
+        return False
+
+    lidar_pos_t = lidar_pos[0] if getattr(lidar_pos, "ndim", 0) == 2 else lidar_pos
+    lidar_quat_t = lidar_quat[0] if getattr(lidar_quat, "ndim", 0) == 2 else lidar_quat
+    local_pos = torch.tensor([[float(x_m), float(y_m), 0.5]], dtype=torch.float32, device=lidar_pos_t.device)
+    world_pos = combine_frame_transforms(lidar_pos_t.reshape(1, 3), lidar_quat_t.reshape(1, 4), local_pos)[0]
+    current_pose = box.data.root_pose_w.clone()
+    current_pose[:, :3] = world_pos.reshape(1, 3).repeat(current_pose.shape[0], 1)
+    box_yaw_w = yaw_from_quat_wxyz(lidar_quat_t.detach().cpu().numpy()) + math.radians(float(yaw_deg)) - math.pi / 2.0
+    box_quat = torch.tensor(
+        [math.cos(0.5 * box_yaw_w), 0.0, 0.0, math.sin(0.5 * box_yaw_w)],
+        dtype=current_pose.dtype,
+        device=current_pose.device,
+    )
+    current_pose[:, 3:7] = box_quat.reshape(1, 4).repeat(current_pose.shape[0], 1)
+    box.write_root_pose_to_sim(current_pose)
+    box.write_root_velocity_to_sim(torch.zeros((current_pose.shape[0], 6), dtype=current_pose.dtype, device=current_pose.device))
+    scene.write_data_to_sim()
+    env.unwrapped.sim.forward()
+    print(
+        "[debug_box_pose_lidar] placed box "
+        f"x={float(x_m):+.2f} y={float(y_m):+.2f} yaw={float(yaw_deg):+.1f}deg"
+    )
+    return True
+
+
 def play() -> tuple[float, float]:
     if args_cli.task is None:
         raise ValueError("Please provide --task, e.g. --task ATEC-TaskA-G1")
@@ -974,6 +1047,9 @@ def play() -> tuple[float, float]:
     )
     if args_cli.seed is not None and hasattr(env_cfg, "seed"):
         env_cfg.seed = args_cli.seed
+    if args_cli.disable_image_obs:
+        disabled_terms = disable_camera_observations(env_cfg)
+        print("[INFO] Disabled camera observations for LiDAR-only run: " + ", ".join(disabled_terms))
 
     if args_cli.sensor_vis:
         lidar_sensor = getattr(env_cfg.scene, "lidar_sensor", None)
@@ -1023,6 +1099,10 @@ def play() -> tuple[float, float]:
     # Reset
     # -------------------------------------------------------------------------
     obs, _ = env.reset(seed=args_cli.seed)
+    if args_cli.debug_box_pose_lidar is not None:
+        placed = place_task_d_box_relative_to_lidar(env, *args_cli.debug_box_pose_lidar)
+        if not placed:
+            print("[debug_box_pose_lidar] failed to place box; missing Task D box or LiDAR sensor.")
     camera_pose_sync = CameraPoseSynchronizer(env, enabled=args_cli.enable_cameras and args_cli.disable_fabric)
     render_sync_hook = RenderPreSyncHook(env, physics_usd_sync.sync, camera_pose_sync.sync)
     render_sync_hook.install()
@@ -1046,6 +1126,16 @@ def play() -> tuple[float, float]:
         lidar_pose_logger=lidar_pose_logger,
         lidar_pose_gt_logger=lidar_pose_gt_logger,
     )
+    lidar_gpu_perception = None
+    if args_cli.debug_lidar_gpu_probe:
+        from demo.solution import get_lidar_perception
+        from scripts.lidar_perception_torch import task_d_lidar_torch_debug_stats
+
+        lidar_gpu_perception = get_lidar_perception(
+            num_envs=args_cli.num_envs,
+            device=args_cli.device,
+            prior=lidar_prior,
+        )
 
     dt = env.unwrapped.step_dt if hasattr(env.unwrapped, "step_dt") else None
     timestep = 0
@@ -1069,15 +1159,18 @@ def play() -> tuple[float, float]:
                         print(f"[play] Switched to policy: {get_policy_name()}")
                 if hasattr(solution, "set_keyboard_command"):
                     solution.set_keyboard_command(nav_cmd, height_cmd)
-            resp = solution.predicts(obs, total_episode_reward)
             should_print_debug = args_cli.debug and timestep % max(1, args_cli.debug_interval) == 0
-            if should_print_debug and hasattr(solution, "get_debug_snapshot"):
-                print(solution.get_debug_snapshot())
-            giveup = resp["giveup"]
-            if giveup:
-                break
-            actions = resp["action"]
-            actions = torch.tensor(actions, dtype=torch.float32, device=args_cli.device).view(args_cli.num_envs, -1)
+            if args_cli.debug_zero_actions:
+                actions = make_zero_actions(env, args_cli.num_envs, args_cli.device)
+            else:
+                resp = solution.predicts(obs, total_episode_reward)
+                if should_print_debug and hasattr(solution, "get_debug_snapshot"):
+                    print(solution.get_debug_snapshot())
+                giveup = resp["giveup"]
+                if giveup:
+                    break
+                actions = resp["action"]
+                actions = torch.tensor(actions, dtype=torch.float32, device=args_cli.device).view(args_cli.num_envs, -1)
             obs, reward, terminated, truncated, info = env.step(actions)
             render_sync_hook.sync()
             if not is_task_e:
@@ -1091,7 +1184,7 @@ def play() -> tuple[float, float]:
 
             if isinstance(info, dict) and "Elapsed_Time" in info:
                 elapsed = info["Elapsed_Time"]  # simulation time from env as primary source
-                total_elapsed_time = elapsed.item() if hasattr(elapsed, "item") else float(elapsed)
+                total_elapsed_time = tensor_mean_float(elapsed)
             elif dt is not None:
                 total_elapsed_time += dt  # wall clock time as fallback
 
@@ -1100,12 +1193,67 @@ def play() -> tuple[float, float]:
                 print(f"total_elapsed_time:{total_elapsed_time: .2f}")
 
             sensor_scene_markers.update(obs, timestep, total_elapsed_time)
+            if lidar_gpu_perception is not None and timestep % max(1, args_cli.debug_interval) == 0:
+                gpu_result = lidar_gpu_perception.update_from_env(env)
+                lidar_env_data = lidar_gpu_perception._get_lidar_env_data(env)
+                lidar_debug_stats = task_d_lidar_torch_debug_stats(
+                    lidar_env_data["ray_hits_w"],
+                    lidar_env_data["pos_w"],
+                    lidar_env_data["quat_w"],
+                    prior=lidar_prior,
+                    max_distance=lidar_env_data["max_distance"],
+                )
+                raw_gpu_result = lidar_gpu_perception.estimate_from_lidar_data(lidar_env_data)
+                box_pose = gpu_result["box_pose"][0]
+                ditch_pose = gpu_result["ditch_pose"][0]
+                raw_box_pose = raw_gpu_result["box_pose"][0]
+                raw_ditch_pose = raw_gpu_result["ditch_pose"][0]
+                box_min_xy = lidar_debug_stats["box_min_xy"][0]
+                box_max_xy = lidar_debug_stats["box_max_xy"][0]
+                box_component_min_xy = lidar_debug_stats["box_component_min_xy"][0]
+                box_component_max_xy = lidar_debug_stats["box_component_max_xy"][0]
+                box_component_extent = lidar_debug_stats["box_component_extent"][0]
+                ditch_min_xy = lidar_debug_stats["ditch_min_xy"][0]
+                ditch_max_xy = lidar_debug_stats["ditch_max_xy"][0]
+                print(
+                    "[lidar_gpu_probe] "
+                    f"device={box_pose.device} "
+                    f"shape={tuple(gpu_result['box_pose'].shape)} "
+                    f"points={int(gpu_result['num_points'][0])} "
+                    f"ground={int(gpu_result['num_ground_inliers'][0])} "
+                    f"box_count={int(lidar_debug_stats['box_count'][0])} "
+                    f"box_h=({int(lidar_debug_stats['box_count_025'][0])},"
+                    f"{int(lidar_debug_stats['box_count_035'][0])},"
+                    f"{int(lidar_debug_stats['box_count_045'][0])}) "
+                    f"box_xy=({float(box_min_xy[0]):+.2f},{float(box_min_xy[1]):+.2f}).."
+                    f"({float(box_max_xy[0]):+.2f},{float(box_max_xy[1]):+.2f}) "
+                    f"box_comp={int(lidar_debug_stats['box_component_count'][0])} "
+                    f"box_comp_xy=({float(box_component_min_xy[0]):+.2f},{float(box_component_min_xy[1]):+.2f}).."
+                    f"({float(box_component_max_xy[0]):+.2f},{float(box_component_max_xy[1]):+.2f}) "
+                    f"box_comp_ext=({float(box_component_extent[0]):+.2f},{float(box_component_extent[1]):+.2f}) "
+                    f"raw_box_valid={bool(raw_gpu_result['box_valid'][0])} "
+                    f"raw_box=({float(raw_box_pose[0]):+.2f},{float(raw_box_pose[1]):+.2f},"
+                    f"{math.degrees(float(raw_box_pose[2])):+.1f}deg) "
+                    f"raw_box_conf={float(raw_gpu_result['box_confidence'][0]):.3f} "
+                    f"ditch_count={int(lidar_debug_stats['ditch_count'][0])} "
+                    f"ditch_xy=({float(ditch_min_xy[0]):+.2f},{float(ditch_min_xy[1]):+.2f}).."
+                    f"({float(ditch_max_xy[0]):+.2f},{float(ditch_max_xy[1]):+.2f}) "
+                    f"raw_ditch_valid={bool(raw_gpu_result['ditch_valid'][0])} "
+                    f"raw_ditch=({float(raw_ditch_pose[0]):+.2f},{float(raw_ditch_pose[1]):+.2f},"
+                    f"{math.degrees(float(raw_ditch_pose[2])):+.1f}deg) "
+                    f"box_valid={bool(gpu_result['box_valid'][0])} "
+                    f"box=({float(box_pose[0]):+.2f},{float(box_pose[1]):+.2f},{math.degrees(float(box_pose[2])):+.1f}deg) "
+                    f"ditch_valid={bool(gpu_result['ditch_valid'][0])} "
+                    f"ditch=({float(ditch_pose[0]):+.2f},{float(ditch_pose[1]):+.2f},{math.degrees(float(ditch_pose[2])):+.1f}deg)"
+                )
 
-            done = (terminated.item() or truncated.item())
+            done = tensor_any_bool(terminated) or tensor_any_bool(truncated)
             if done:
                 break
 
             timestep += 1
+            if args_cli.max_steps > 0 and timestep >= args_cli.max_steps:
+                break
             # If recording one video, exit after video_length steps
             if args_cli.video and timestep >= args_cli.video_length:
                 break

@@ -2,6 +2,8 @@ from typing import Any
 
 _policy_name = None
 _impl = None
+_lidar_perception = None
+_lidar_perception_key = None
 
 
 def _ensure_impl():
@@ -34,6 +36,25 @@ def set_policy(name: str) -> bool:
 
 def get_policy_name() -> str:
     return _policy_name or "gr00t"
+
+
+def get_lidar_perception(num_envs: int, device: str = "cuda", prior=None, init_samples: int = 5):
+    global _lidar_perception, _lidar_perception_key
+    key = (int(num_envs), str(device), int(init_samples), id(prior))
+    if _lidar_perception is not None and _lidar_perception_key == key:
+        return _lidar_perception
+    try:
+        from demo.lidar_perception import TaskDLidarGpuPerception
+    except ImportError:
+        from lidar_perception import TaskDLidarGpuPerception
+    _lidar_perception = TaskDLidarGpuPerception(
+        num_envs=int(num_envs),
+        device=device,
+        prior=prior,
+        init_samples=int(init_samples),
+    )
+    _lidar_perception_key = key
+    return _lidar_perception
 
 
 class AlgSolution:

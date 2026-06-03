@@ -136,13 +136,38 @@ class LidarPoseStabilizer:
 
         measurement = estimate_to_world_track(estimate, sensor_pos, sensor_quat)
         swapped_axis = False
-        if self._box_world is not None:
+        initializing = len(self._box_init_world) < self.init_samples
+        if initializing and self._is_degenerate_box_edge(estimate):
+            if self._box_world is not None:
+                return self._track_to_lidar_estimate(
+                    self._box_world,
+                    sensor_pos,
+                    sensor_quat,
+                    "init_degenerate_edge",
+                    confidence_scale=0.85,
+                )
+            return Pose2DEstimate(label="box", message="init_degenerate_edge")
+        if initializing and self._is_oversized_low_conf_box_init(estimate):
+            if self._box_world is not None:
+                return self._track_to_lidar_estimate(
+                    self._box_world,
+                    sensor_pos,
+                    sensor_quat,
+                    "init_oversized_low_conf",
+                    confidence_scale=0.85,
+                )
+            return Pose2DEstimate(label="box", message="init_oversized_low_conf")
+
+        trust_raw_init_yaw = initializing and self._trust_raw_box_init_yaw(estimate)
+        if self._box_world is not None and trust_raw_init_yaw:
+            measurement.yaw_w = align_axis_yaw_to_reference(measurement.yaw_w, self._box_world.yaw_w)
+        elif self._box_world is not None:
             measurement.yaw_w, swapped_axis = self._closest_box_world_yaw(
                 self._box_world.yaw_w,
                 measurement.yaw_w,
                 return_axis_swap=True,
             )
-        elif self._box_yaw_anchor is None:
+        elif self._box_yaw_anchor is None and not trust_raw_init_yaw:
             measurement.yaw_w, swapped_axis = self._closest_box_world_yaw(
                 math.pi / 2.0,
                 measurement.yaw_w,
@@ -209,6 +234,34 @@ class LidarPoseStabilizer:
             estimate=replace(estimate, confidence=confidence, message=message),
         )
         return self._track_to_lidar_estimate(self._box_world, sensor_pos, sensor_quat, message)
+
+    @staticmethod
+    def _is_degenerate_box_edge(estimate: Pose2DEstimate) -> bool:
+        if estimate.message != "edge":
+            return False
+        if not math.isfinite(float(estimate.extent_x)) or not math.isfinite(float(estimate.extent_y)):
+            return False
+        return min(float(estimate.extent_x), float(estimate.extent_y)) < 0.05
+
+    @staticmethod
+    def _is_oversized_low_conf_box_init(estimate: Pose2DEstimate) -> bool:
+        if estimate.message != "ok" or estimate.confidence >= 0.75:
+            return False
+        if not math.isfinite(float(estimate.extent_x)) or not math.isfinite(float(estimate.extent_y)):
+            return False
+        return float(estimate.extent_x) > 1.12 or float(estimate.extent_y) > 0.92
+
+    @staticmethod
+    def _trust_raw_box_init_yaw(estimate: Pose2DEstimate) -> bool:
+        if estimate.message != "ok" or estimate.confidence < 0.75:
+            return False
+        if estimate.num_points < 120:
+            return False
+        if not math.isfinite(float(estimate.extent_x)) or not math.isfinite(float(estimate.extent_y)):
+            return False
+        if min(float(estimate.extent_x), float(estimate.extent_y)) < 0.18:
+            return False
+        return math.hypot(float(estimate.x), float(estimate.y)) <= 1.25
 
     def _update_ditch_world(
         self,
@@ -866,7 +919,7 @@ def _infer_axis_center_from_visible_bounds(
     observed_extent: float,
     midpoint: float,
 ) -> float:
-    if observed_extent >= 0.65 * expected_size:
+    if observed_extent >= 0.90 * expected_size:
         return midpoint
     min_p = float(np.min(projections))
     max_p = float(np.max(projections))
@@ -875,6 +928,78 @@ def _infer_axis_center_from_visible_bounds(
     if mean_p >= 0.0:
         return min_p + half
     return max_p - half
+
+
+def _single_edge_box_pose_candidates(
+    points_xy: np.ndarray,
+    base_yaw: float,
+    prior: BoxPrior,
+) -> list[tuple[float, Pose2DEstimate]]:
+    candidates: list[tuple[float, Pose2DEstimate]] = []
+    for yaw in (base_yaw, wrap_axis_yaw(base_yaw + math.pi / 2.0)):
+        u, v, proj_u, proj_v = oriented_bounds(points_xy, yaw)
+        min_u, max_u = float(np.min(proj_u)), float(np.max(proj_u))
+        min_v, max_v = float(np.min(proj_v)), float(np.max(proj_v))
+        extent_u = max_u - min_u
+        extent_v = max_v - min_v
+        center_u = 0.5 * (min_u + max_u)
+        center_v = 0.5 * (min_v + max_v)
+        edge_center = center_u * u + center_v * v
+        edge_norm = float(np.linalg.norm(edge_center))
+        edge_dir = edge_center / max(edge_norm, 1.0e-6)
+
+        if extent_u < 0.08 <= extent_v:
+            edge_score = dimension_match_score(extent_v, prior.width)
+            center_v = _infer_axis_center_from_visible_bounds(proj_v, prior.width, extent_v, center_v)
+            for sign in (-1.0, 1.0):
+                candidate_center = (center_u + sign * 0.5 * prior.length) * u + center_v * v
+                if float(candidate_center @ edge_dir) <= edge_norm:
+                    continue
+                score = edge_score + 0.20 - 0.008 * points_xy.shape[0] + 0.03 * float(np.linalg.norm(candidate_center))
+                candidates.append(
+                    (
+                        score,
+                        Pose2DEstimate(
+                            label="box",
+                            valid=True,
+                            x=float(candidate_center[0]),
+                            y=float(candidate_center[1]),
+                            yaw=wrap_axis_yaw(yaw),
+                            confidence=max(0.0, min(1.0, 0.55 / (1.0 + edge_score) + 0.35)),
+                            num_points=int(points_xy.shape[0]),
+                            extent_x=float(extent_u),
+                            extent_y=float(extent_v),
+                            message="edge",
+                        ),
+                    )
+                )
+
+        if extent_v < 0.08 <= extent_u:
+            edge_score = dimension_match_score(extent_u, prior.length)
+            center_u = _infer_axis_center_from_visible_bounds(proj_u, prior.length, extent_u, center_u)
+            for sign in (-1.0, 1.0):
+                candidate_center = center_u * u + (center_v + sign * 0.5 * prior.width) * v
+                if float(candidate_center @ edge_dir) <= edge_norm:
+                    continue
+                score = edge_score + 0.20 - 0.008 * points_xy.shape[0] + 0.03 * float(np.linalg.norm(candidate_center))
+                candidates.append(
+                    (
+                        score,
+                        Pose2DEstimate(
+                            label="box",
+                            valid=True,
+                            x=float(candidate_center[0]),
+                            y=float(candidate_center[1]),
+                            yaw=wrap_axis_yaw(yaw),
+                            confidence=max(0.0, min(1.0, 0.55 / (1.0 + edge_score) + 0.35)),
+                            num_points=int(points_xy.shape[0]),
+                            extent_x=float(extent_u),
+                            extent_y=float(extent_v),
+                            message="edge",
+                        ),
+                    )
+                )
+    return candidates
 
 
 def estimate_box_pose(points_l: np.ndarray, ground_plane: np.ndarray, prior: BoxPrior) -> Pose2DEstimate:
@@ -892,6 +1017,9 @@ def estimate_box_pose(points_l: np.ndarray, ground_plane: np.ndarray, prior: Box
     for cluster_idx in clusters:
         cluster = candidate_points[cluster_idx]
         base_yaw = pca_yaw(cluster[:, :2])
+        for edge_candidate in _single_edge_box_pose_candidates(cluster[:, :2], base_yaw, prior):
+            if best is None or edge_candidate[0] < best[0]:
+                best = edge_candidate
         for yaw in (base_yaw, wrap_axis_yaw(base_yaw + math.pi / 2.0)):
             center, extent_length_axis, extent_width_axis = infer_rectangle_pose(
                 cluster[:, :2],
