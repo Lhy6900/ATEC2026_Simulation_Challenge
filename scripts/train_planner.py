@@ -1,7 +1,7 @@
 """Train a high-level planner for the box-pushing task.
 
 Usage:
-    PYTHONPATH=. python scripts/train_planner.py --num_envs 64 --headless
+    PYTHONPATH=. python scripts/train_planner.py --num_envs 1024 --headless
 
 The planner outputs [vx, vy, vyaw] at 50Hz, which is fed directly to the
 GR00T low-level locomotion policy (also running at 50Hz on GPU).
@@ -13,12 +13,31 @@ import argparse
 import os
 import sys
 
-import torch
-from rsl_rl.runners import OnPolicyRunner
-
 # Ensure project root is importable
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+
+from isaaclab.app import AppLauncher
+
+# ── CLI (must be before AppLauncher creation) ──────────────────────────────
+parser = argparse.ArgumentParser(description="Train planner for box-pushing task")
+parser.add_argument("--num_envs", type=int, default=256)
+parser.add_argument("--headless", action="store_true")
+parser.add_argument("--max_iterations", type=int, default=None)
+parser.add_argument("--episode_length_s", type=int, default=60)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+# Force headless for training
+args_cli.headless = True
+
+# ── Launch Isaac Sim (must happen BEFORE any IsaacLab/ATEC imports) ────────
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+# ── Imports AFTER simulation_app is created (IsaacLab pattern) ─────────────
+import torch  # noqa: E402
+from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
 from source.atec_rl_lab.atec_rl_lab.tasks.task_d import TaskDEnvG1Cfg  # noqa: E402
 from scripts.low_level_policy import GrootLowLevelPolicy  # noqa: E402
@@ -73,17 +92,10 @@ TRAIN_CFG = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train planner for box-pushing task")
-    parser.add_argument("--num_envs", type=int, default=256)
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--max_iterations", type=int, default=None)
-    parser.add_argument("--episode_length_s", type=int, default=60)
-    args = parser.parse_args()
-
     # Environment config
     env_cfg = TaskDEnvG1Cfg()
-    env_cfg.scene.num_envs = args.num_envs
-    env_cfg.episode_length_s = args.episode_length_s
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.episode_length_s = args_cli.episode_length_s
 
     # Low-level policy
     low_level = GrootLowLevelPolicy(device="cuda:0")
@@ -94,8 +106,8 @@ def main():
 
     # Training config
     train_cfg = dict(TRAIN_CFG)
-    if args.max_iterations is not None:
-        train_cfg["max_iterations"] = args.max_iterations
+    if args_cli.max_iterations is not None:
+        train_cfg["max_iterations"] = args_cli.max_iterations
 
     # Log directory
     log_root = os.path.join(PROJECT_ROOT, "logs", "planner_box_push")
@@ -114,6 +126,8 @@ def main():
     final_path = os.path.join(log_root, "model_final.pt")
     torch.save(runner.alg.actor_critic.state_dict(), final_path)
     print(f"Saved final model to {final_path}")
+
+    simulation_app.close()
 
 
 if __name__ == "__main__":
