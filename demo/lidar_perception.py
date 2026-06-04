@@ -73,7 +73,11 @@ class TaskDLidarGpuPerception:
     def update_from_lidar_data(self, lidar: dict[str, Any]) -> dict[str, torch.Tensor]:
         result_dict = self.estimate_from_lidar_data(lidar)
         result = TorchLidarPerceptionResult(**result_dict)
-        stable = self.stabilizer.update(result)
+        stable = self.stabilizer.update(
+            result,
+            lidar_pos_w=lidar["pos_w"],
+            lidar_quat_w=lidar["quat_w"],
+        )
         return {
             "box_pose": stable.box_pose,
             "box_valid": stable.box_valid,

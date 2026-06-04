@@ -52,6 +52,7 @@ class TorchLidarPoseStabilizer:
         self.box_confidence = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.box_init_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.box_yaw_anchor = torch.full((self.num_envs,), float("nan"), dtype=torch.float32, device=self.device)
+        self.box_pose_w = torch.full((self.num_envs, 3), float("nan"), dtype=torch.float32, device=self.device)
         self.box_init_pose_samples = torch.full(
             (self.num_envs, self.box_init_history_size, 3),
             float("nan"),
@@ -73,6 +74,7 @@ class TorchLidarPoseStabilizer:
         self.ditch_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.ditch_confidence = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.ditch_init_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.ditch_pose_w = torch.full((self.num_envs, 3), float("nan"), dtype=torch.float32, device=self.device)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         if env_ids is None:
@@ -84,6 +86,7 @@ class TorchLidarPoseStabilizer:
         self.box_confidence[env_ids] = 0.0
         self.box_init_count[env_ids] = 0
         self.box_yaw_anchor[env_ids] = float("nan")
+        self.box_pose_w[env_ids] = float("nan")
         self.box_init_pose_samples[env_ids] = float("nan")
         self.box_init_conf_samples[env_ids] = 0.0
         self.box_init_sample_valid[env_ids] = False
@@ -92,8 +95,19 @@ class TorchLidarPoseStabilizer:
         self.ditch_valid[env_ids] = False
         self.ditch_confidence[env_ids] = 0.0
         self.ditch_init_count[env_ids] = 0
+        self.ditch_pose_w[env_ids] = float("nan")
 
-    def update(self, result: TorchLidarPerceptionResult) -> TorchLidarPerceptionResult:
+    def update(
+        self,
+        result: TorchLidarPerceptionResult,
+        lidar_pos_w: Any | None = None,
+        lidar_quat_w: Any | None = None,
+    ) -> TorchLidarPerceptionResult:
+        if lidar_pos_w is not None and lidar_quat_w is not None:
+            return self._update_world(result, lidar_pos_w, lidar_quat_w)
+        return self._update_lidar(result)
+
+    def _update_lidar(self, result: TorchLidarPerceptionResult) -> TorchLidarPerceptionResult:
         measured_box_pose = result.box_pose.to(device=self.device, dtype=torch.float32)
         measured_box_confidence = result.box_confidence.to(device=self.device, dtype=torch.float32)
         measured_box_valid = (
@@ -150,6 +164,98 @@ class TorchLidarPoseStabilizer:
         self.ditch_pose = ditch_pose
         self.ditch_valid = ditch_valid
         self.ditch_confidence = ditch_confidence
+
+        return TorchLidarPerceptionResult(
+            box_pose=_apply_box_output_bias(self.box_pose),
+            box_valid=self.box_valid & (self.box_init_count >= self.init_samples),
+            box_confidence=self.box_confidence,
+            ditch_pose=self.ditch_pose,
+            ditch_valid=self.ditch_valid & (self.ditch_init_count >= self.init_samples),
+            ditch_confidence=self.ditch_confidence,
+            num_points=result.num_points.to(device=self.device),
+            num_ground_inliers=result.num_ground_inliers.to(device=self.device),
+        )
+
+    def _update_world(
+        self,
+        result: TorchLidarPerceptionResult,
+        lidar_pos_w: Any,
+        lidar_quat_w: Any,
+    ) -> TorchLidarPerceptionResult:
+        lidar_pos = _as_torch(lidar_pos_w, device=self.device).to(dtype=torch.float32)
+        lidar_quat = _as_torch(lidar_quat_w, device=self.device).to(dtype=torch.float32)
+        if lidar_pos.ndim == 1:
+            lidar_pos = lidar_pos.unsqueeze(0)
+        if lidar_quat.ndim == 1:
+            lidar_quat = lidar_quat.unsqueeze(0)
+
+        measured_box_pose_l = result.box_pose.to(device=self.device, dtype=torch.float32)
+        measured_box_confidence = result.box_confidence.to(device=self.device, dtype=torch.float32)
+        measured_box_valid = (
+            result.box_valid.to(device=self.device)
+            & ~_is_startup_box_edge_outlier(
+                measured_box_pose_l,
+                measured_box_confidence,
+                self.box_valid,
+                self.box_init_count,
+                self.init_samples,
+            )
+        )
+        measured_box_pose_w = lidar_pose_to_world_pose_torch(measured_box_pose_l, lidar_pos, lidar_quat)
+        fast_box_init = _is_fast_reliable_box_init_sample(
+            measured_pose=measured_box_pose_l,
+            measured_valid=measured_box_valid,
+            measured_confidence=measured_box_confidence,
+        )
+        (
+            box_pose_w,
+            box_valid,
+            box_confidence,
+            self.box_init_count,
+            self.box_yaw_anchor,
+        ) = _stabilize_box_pose_batch(
+            measured_pose=measured_box_pose_w,
+            measured_valid=measured_box_valid,
+            measured_confidence=measured_box_confidence,
+            state_pose=self.box_pose_w,
+            state_valid=self.box_valid,
+            state_confidence=self.box_confidence,
+            init_count=self.box_init_count,
+            init_samples=self.init_samples,
+            max_step_xy=self.max_step_xy,
+            max_yaw_step=self.max_yaw_step,
+            yaw_anchor=self.box_yaw_anchor,
+            init_pose_samples=self.box_init_pose_samples,
+            init_conf_samples=self.box_init_conf_samples,
+            init_sample_valid=self.box_init_sample_valid,
+            init_write_index=self.box_init_write_index,
+            init_yaw_gate=math.radians(35.0),
+            init_xy_gate=0.22,
+            fast_init_mask=fast_box_init,
+        )
+        self.box_pose_w = box_pose_w
+        self.box_valid = box_valid
+        self.box_confidence = box_confidence
+        self.box_pose = world_pose_to_lidar_pose_torch(self.box_pose_w, lidar_pos, lidar_quat)
+
+        measured_ditch_pose_l = result.ditch_pose.to(device=self.device, dtype=torch.float32)
+        measured_ditch_pose_w = lidar_pose_to_world_pose_torch(measured_ditch_pose_l, lidar_pos, lidar_quat)
+        ditch_pose_w, ditch_valid, ditch_confidence, self.ditch_init_count = _stabilize_pose_batch(
+            measured_pose=measured_ditch_pose_w,
+            measured_valid=result.ditch_valid.to(device=self.device),
+            measured_confidence=result.ditch_confidence.to(device=self.device, dtype=torch.float32),
+            state_pose=self.ditch_pose_w,
+            state_valid=self.ditch_valid,
+            state_confidence=self.ditch_confidence,
+            init_count=self.ditch_init_count,
+            init_samples=self.init_samples,
+            max_step_xy=0.45,
+            max_yaw_step=math.radians(20.0),
+        )
+        self.ditch_pose_w = ditch_pose_w
+        self.ditch_valid = ditch_valid
+        self.ditch_confidence = ditch_confidence
+        self.ditch_pose = world_pose_to_lidar_pose_torch(self.ditch_pose_w, lidar_pos, lidar_quat)
 
         return TorchLidarPerceptionResult(
             box_pose=_apply_box_output_bias(self.box_pose),
@@ -250,6 +356,7 @@ def _stabilize_box_pose_batch(
     init_write_index: torch.Tensor,
     init_yaw_gate: float,
     init_xy_gate: float,
+    fast_init_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     measured_valid = measured_valid & torch.isfinite(measured_pose).all(dim=1)
     initialized = state_valid & (init_count >= int(init_samples))
@@ -301,11 +408,15 @@ def _stabilize_box_pose_batch(
         init_xy_gate=float(init_xy_gate),
     )
     cluster_ready = startup & (cluster_count >= int(init_samples)) & torch.isfinite(cluster_pose).all(dim=1)
-    fast_ready = startup & _is_fast_reliable_box_init_sample(
-        measured_pose=measured_pose,
-        measured_valid=measured_valid,
-        measured_confidence=measured_confidence,
-    )
+    if fast_init_mask is None:
+        fast_init_mask = _is_fast_reliable_box_init_sample(
+            measured_pose=measured_pose,
+            measured_valid=measured_valid,
+            measured_confidence=measured_confidence,
+        )
+    else:
+        fast_init_mask = fast_init_mask.to(device=measured_pose.device)
+    fast_ready = startup & fast_init_mask
     cluster_pose = torch.where(fast_ready[:, None], measured_pose, cluster_pose)
     cluster_confidence = torch.where(fast_ready, measured_confidence, cluster_confidence)
     cluster_yaw = torch.where(fast_ready, wrap_axis_yaw_torch(measured_pose[:, 2]), cluster_yaw)
@@ -477,6 +588,60 @@ def quat_inverse_apply_torch(quat_wxyz: torch.Tensor, vectors: torch.Tensor) -> 
     return vectors + inv_w * t + torch.cross(inv_xyz.expand_as(vectors), t, dim=-1)
 
 
+def quat_apply_torch(quat_wxyz: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
+    quat = quat_wxyz.to(dtype=vectors.dtype)
+    xyz = quat[..., 1:4]
+    w = quat[..., 0:1]
+    while xyz.ndim < vectors.ndim:
+        xyz = xyz.unsqueeze(-2)
+        w = w.unsqueeze(-2)
+    t = torch.cross(xyz.expand_as(vectors), vectors, dim=-1) * 2.0
+    return vectors + w * t + torch.cross(xyz.expand_as(vectors), t, dim=-1)
+
+
+def yaw_from_quat_wxyz_torch(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    quat = quat_wxyz.to(dtype=torch.float32)
+    qw = quat[..., 0]
+    qx = quat[..., 1]
+    qy = quat[..., 2]
+    qz = quat[..., 3]
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return torch.atan2(siny_cosp, cosy_cosp)
+
+
+def lidar_pose_to_world_pose_torch(
+    pose_l: torch.Tensor,
+    lidar_pos_w: torch.Tensor,
+    lidar_quat_w: torch.Tensor,
+) -> torch.Tensor:
+    finite = torch.isfinite(pose_l).all(dim=1)
+    local_xyz = torch.cat(
+        [pose_l[:, :2], torch.zeros((pose_l.shape[0], 1), dtype=pose_l.dtype, device=pose_l.device)],
+        dim=1,
+    )
+    xyz_w = quat_apply_torch(lidar_quat_w[:, :4], local_xyz) + lidar_pos_w[:, :3]
+    yaw_w = pose_l[:, 2] + yaw_from_quat_wxyz_torch(lidar_quat_w[:, :4])
+    pose_w = torch.cat([xyz_w[:, :2], yaw_w[:, None]], dim=1)
+    return torch.where(finite[:, None], pose_w, torch.full_like(pose_w, float("nan")))
+
+
+def world_pose_to_lidar_pose_torch(
+    pose_w: torch.Tensor,
+    lidar_pos_w: torch.Tensor,
+    lidar_quat_w: torch.Tensor,
+) -> torch.Tensor:
+    finite = torch.isfinite(pose_w).all(dim=1)
+    xyz_w = torch.cat(
+        [pose_w[:, :2], torch.zeros((pose_w.shape[0], 1), dtype=pose_w.dtype, device=pose_w.device)],
+        dim=1,
+    )
+    rel_l = quat_inverse_apply_torch(lidar_quat_w[:, :4], xyz_w - lidar_pos_w[:, :3])
+    yaw_l = pose_w[:, 2] - yaw_from_quat_wxyz_torch(lidar_quat_w[:, :4])
+    pose_l = torch.cat([rel_l[:, :2], yaw_l[:, None]], dim=1)
+    return torch.where(finite[:, None], pose_l, torch.full_like(pose_l, float("nan")))
+
+
 def world_points_to_lidar_frame_torch(
     points_w: Any,
     lidar_pos_w: Any,
@@ -570,6 +735,25 @@ def _dimension_score_torch(observed: torch.Tensor, expected: float) -> torch.Ten
     return 2.0 * over + 0.35 * under
 
 
+def _line_likeness_torch(points_xy: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    weights = valid.to(dtype=points_xy.dtype)
+    safe_points = torch.where(valid[..., None], points_xy, torch.zeros_like(points_xy))
+    raw_count = weights.sum(dim=1)
+    count = raw_count.clamp_min(1.0)
+    mean = safe_points.sum(dim=1) / count[:, None]
+    centered = torch.where(valid[..., None], points_xy - mean[:, None, :], torch.zeros_like(points_xy))
+    denom = (count - 1.0).clamp_min(1.0)
+    cov_xx = (centered[..., 0] * centered[..., 0]).sum(dim=1) / denom
+    cov_yy = (centered[..., 1] * centered[..., 1]).sum(dim=1) / denom
+    cov_xy = (centered[..., 0] * centered[..., 1]).sum(dim=1) / denom
+    trace = cov_xx + cov_yy
+    discriminant = torch.sqrt((cov_xx - cov_yy) * (cov_xx - cov_yy) + 4.0 * cov_xy * cov_xy)
+    major = (0.5 * (trace + discriminant)).clamp_min(1.0e-6)
+    minor = (0.5 * (trace - discriminant)).clamp_min(0.0)
+    ratio = minor / major
+    return (raw_count >= 12.0) & (ratio <= 0.035)
+
+
 def _choose_box_axis(
     points_xy: torch.Tensor,
     box_mask: torch.Tensor,
@@ -658,6 +842,7 @@ def _choose_box_axis_grid(
     proj_u = torch.einsum("bnd,kd->bkn", selected_xy, u)
     proj_v = torch.einsum("bnd,kd->bkn", selected_xy, v)
     valid = selected_valid
+    line_like = _line_likeness_torch(selected_xy, selected_valid).to(dtype=dtype)[:, None]
 
     min_u = torch.where(valid[:, None, :], proj_u, inf).amin(dim=2)
     max_u = torch.where(valid[:, None, :], proj_u, -inf).amax(dim=2)
@@ -682,7 +867,7 @@ def _choose_box_axis_grid(
     full_score = _dimension_score_torch(extent_u, float(length)) + _dimension_score_torch(extent_v, float(width))
     full_score = torch.where(
         full_valid,
-        full_score + 0.03 * torch.linalg.norm(center, dim=2),
+        full_score + 0.03 * torch.linalg.norm(center, dim=2) + 0.55 * line_like,
         torch.full_like(full_score, float("inf")),
     )
 
@@ -696,7 +881,8 @@ def _choose_box_axis_grid(
     cand_u_neg = (center_u_mid - 0.5 * float(length))[..., None] * u[None, :, :] + edge_center_v[..., None] * v[None, :, :]
     use_u_pos = (cand_u_pos * edge_dir).sum(dim=2) >= (cand_u_neg * edge_dir).sum(dim=2)
     edge_u_center = torch.where(use_u_pos[..., None], cand_u_pos, cand_u_neg)
-    edge_u_score = _dimension_score_torch(extent_v, float(width)) + 0.20 + 0.03 * torch.linalg.norm(edge_u_center, dim=2)
+    edge_u_score = _dimension_score_torch(extent_v, float(width)) + 0.12 + 0.03 * torch.linalg.norm(edge_u_center, dim=2)
+    edge_u_score = edge_u_score - 0.10 * line_like
     edge_u_score = torch.where(thin_u, edge_u_score, torch.full_like(edge_u_score, float("inf")))
 
     thin_v = (extent_v < 0.08) & (extent_u >= 0.08) & enough
@@ -705,7 +891,8 @@ def _choose_box_axis_grid(
     cand_v_neg = edge_center_u[..., None] * u[None, :, :] + (center_v_mid - 0.5 * float(width))[..., None] * v[None, :, :]
     use_v_pos = (cand_v_pos * edge_dir).sum(dim=2) >= (cand_v_neg * edge_dir).sum(dim=2)
     edge_v_center = torch.where(use_v_pos[..., None], cand_v_pos, cand_v_neg)
-    edge_v_score = _dimension_score_torch(extent_u, float(length)) + 0.20 + 0.03 * torch.linalg.norm(edge_v_center, dim=2)
+    edge_v_score = _dimension_score_torch(extent_u, float(length)) + 0.12 + 0.03 * torch.linalg.norm(edge_v_center, dim=2)
+    edge_v_score = edge_v_score - 0.10 * line_like
     edge_v_score = torch.where(thin_v, edge_v_score, torch.full_like(edge_v_score, float("inf")))
 
     all_scores = torch.cat([full_score, edge_u_score, edge_v_score], dim=1)
@@ -908,10 +1095,118 @@ def _estimate_ditch_torch(
         & (short_extent <= float(ditch_prior.width) + 0.7)
         & (long_extent >= torch.maximum(torch.full_like(short_extent, 0.45), 1.25 * short_extent))
     )
+
+    double_edge_center, double_edge_yaw, double_edge_confidence, double_edge_valid = _estimate_ditch_double_edge_pose_torch(
+        points_l[..., :2],
+        ditch_mask,
+        yaw,
+        float(ditch_prior.width),
+    )
+    use_double_edge = double_edge_valid & (~valid | (double_edge_confidence > confidence))
+    center = torch.where(use_double_edge[:, None], double_edge_center, center)
+    yaw = torch.where(use_double_edge, double_edge_yaw, yaw)
+    confidence = torch.where(use_double_edge, double_edge_confidence, confidence)
+    valid = valid | double_edge_valid
+
+    edge_center, edge_yaw, edge_confidence, edge_valid = _estimate_ditch_edge_pose_torch(
+        points_l[..., :2],
+        ditch_mask,
+        center,
+        yaw,
+        long_extent,
+        short_extent,
+        counts,
+        float(ditch_prior.width),
+    )
+    use_edge = edge_valid & (~valid | (edge_confidence > confidence))
+    center = torch.where(use_edge[:, None], edge_center, center)
+    yaw = torch.where(use_edge, edge_yaw, yaw)
+    confidence = torch.where(use_edge, edge_confidence, confidence)
+    valid = valid | edge_valid
+
     pose = torch.cat([center, yaw[:, None]], dim=1)
     pose = torch.where(valid[:, None], pose, torch.full_like(pose, float("nan")))
     confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
     return pose, valid, confidence
+
+
+def _estimate_ditch_double_edge_pose_torch(
+    points_xy: torch.Tensor,
+    ditch_mask: torch.Tensor,
+    yaw_hint: torch.Tensor,
+    width: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = points_xy.dtype
+    inf = torch.tensor(float("inf"), dtype=dtype, device=points_xy.device)
+    safe_points = torch.where(ditch_mask[..., None], points_xy, torch.zeros_like(points_xy))
+    yaw = yaw_hint
+    u = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
+    v = torch.stack([-torch.sin(yaw), torch.cos(yaw)], dim=1)
+    proj_u = (safe_points * u[:, None, :]).sum(dim=-1)
+    proj_v = (safe_points * v[:, None, :]).sum(dim=-1)
+    min_u = torch.where(ditch_mask, proj_u, inf).amin(dim=1)
+    max_u = torch.where(ditch_mask, proj_u, -inf).amax(dim=1)
+    min_v = torch.where(ditch_mask, proj_v, inf).amin(dim=1)
+    max_v = torch.where(ditch_mask, proj_v, -inf).amax(dim=1)
+    long_extent = max_u - min_u
+    width_extent = max_v - min_v
+    center_u = 0.5 * (min_u + max_u)
+    center_v = 0.5 * (min_v + max_v)
+    center = center_u[:, None] * u + center_v[:, None] * v
+    counts = ditch_mask.to(dtype=dtype).sum(dim=1)
+
+    width_error = torch.abs(width_extent - float(width)) / max(float(width), 1.0e-6)
+    valid = (
+        (counts >= 16.0)
+        & (long_extent >= 0.45)
+        & (width_extent >= 0.55 * float(width))
+        & (width_extent <= float(width) + 0.35)
+        & (width_error <= 0.35)
+        & torch.isfinite(center).all(dim=1)
+    )
+    density_bonus = (counts / 160.0).clamp(max=1.0)
+    extent_bonus = (long_extent / 2.5).clamp(max=1.0)
+    match_bonus = (1.0 - width_error).clamp(0.0, 1.0)
+    confidence = (0.25 + 0.25 * density_bonus + 0.25 * extent_bonus + 0.25 * match_bonus).clamp(0.0, 1.0)
+    confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
+    return center, yaw, confidence, valid
+
+
+def _estimate_ditch_edge_pose_torch(
+    points_xy: torch.Tensor,
+    ditch_mask: torch.Tensor,
+    strip_center: torch.Tensor,
+    strip_yaw: torch.Tensor,
+    long_extent: torch.Tensor,
+    short_extent: torch.Tensor,
+    counts: torch.Tensor,
+    width: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = points_xy.dtype
+    yaw = strip_yaw
+    u = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
+    v = torch.stack([-torch.sin(yaw), torch.cos(yaw)], dim=1)
+    edge_norm = torch.linalg.norm(strip_center, dim=1).clamp_min(1.0e-6)
+    edge_dir = strip_center / edge_norm[:, None]
+    center_v_mid = (strip_center * v).sum(dim=1)
+    center_u_mid = (strip_center * u).sum(dim=1)
+    cand_v_pos = center_u_mid[:, None] * u + (center_v_mid + 0.5 * float(width))[:, None] * v
+    cand_v_neg = center_u_mid[:, None] * u + (center_v_mid - 0.5 * float(width))[:, None] * v
+    use_pos = (cand_v_pos * edge_dir).sum(dim=1) >= (cand_v_neg * edge_dir).sum(dim=1)
+    center = torch.where(use_pos[:, None], cand_v_pos, cand_v_neg)
+
+    thin_strip = short_extent < torch.minimum(
+        torch.full_like(short_extent, 0.35),
+        torch.full_like(short_extent, 0.55 * float(width)),
+    )
+    long_enough = long_extent >= torch.maximum(torch.full_like(long_extent, 0.45), 1.25 * short_extent)
+    valid = (counts >= 10) & thin_strip & long_enough & torch.isfinite(center).all(dim=1)
+    density_bonus = (counts.to(dtype=dtype) / 120.0).clamp(max=1.0)
+    extent_bonus = (long_extent / 2.5).clamp(max=1.0)
+    front_bonus = (center[:, 0] / 3.0).clamp(0.0, 1.0)
+    confidence = (0.30 + 0.25 * density_bonus + 0.25 * extent_bonus + 0.20 * front_bonus).clamp(0.0, 1.0)
+    confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
+    return center, yaw, confidence, valid
 
 
 def _masked_quantile_torch(values: torch.Tensor, mask: torch.Tensor, quantile: float) -> torch.Tensor:
