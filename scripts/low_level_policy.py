@@ -81,11 +81,69 @@ class GrootLowLevelPolicy:
         self._num_envs: int = 0
         self._obs_history: list[torch.Tensor] | None = None
         self._last_lower_action: torch.Tensor | None = None
+        self._baseline_single_obs: torch.Tensor | None = None
+        self._baseline_full_obs: torch.Tensor | None = None
+        self._pending_reset_env_ids: torch.Tensor | None = None
+        self._pending_reset_compare_printed = False
 
     def reset(self, num_envs: int) -> None:
         self._num_envs = num_envs
         self._obs_history = None
         self._last_lower_action = torch.zeros(num_envs, GR00T_NUM_ACTIONS, device=self.device)
+        self._baseline_single_obs = None
+        self._baseline_full_obs = None
+        self._pending_reset_env_ids = None
+        self._pending_reset_compare_printed = False
+
+    def reset_envs(self, env_ids: torch.Tensor, current_single_obs: torch.Tensor) -> None:
+        """Reset GR00T history for specific environments (after auto-reset).
+
+        After auto-reset, the next predict call will append a new obs frame.
+        We need the history to look like: [0, 0, 0, 0, 0, <next_obs>].
+        Since the next _stack_history will append the new obs and left-pad,
+        we set all existing frames to zero for done envs so the result is
+        [0, 0, 0, 0, 0, new_obs] (matching adapter's reset behavior).
+        """
+        if self._last_lower_action is not None:
+            self._last_lower_action[env_ids] = 0.0
+        if self._obs_history is not None:
+            zero_frame = torch.zeros_like(self._obs_history[0])
+            for i in range(len(self._obs_history)):
+                self._obs_history[i][env_ids] = zero_frame[env_ids]
+        self._pending_reset_env_ids = env_ids.detach().clone()
+
+    def debug_compare_full_reset_equivalence(
+        self, env_ids: torch.Tensor, next_single_obs: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Compare current partial-reset state against ideal full-reset semantics.
+
+        Returns diagnostics for the env_ids only. This is read-only and intended
+        for debugging reset behavior differences between full reset and auto-reset.
+        """
+        env_ids = env_ids.reshape(-1)
+        if env_ids.numel() == 0:
+            return {}
+
+        if self._obs_history is None:
+            current_hist = torch.zeros(
+                env_ids.numel(), GR00T_NUM_OBS, device=self.device, dtype=next_single_obs.dtype
+            )
+        else:
+            current_hist = torch.cat([frame[env_ids] for frame in self._obs_history], dim=-1)
+
+        zero_frame = torch.zeros_like(next_single_obs[env_ids])
+        ideal_frames = [zero_frame for _ in range(GR00T_HISTORY_LEN - 1)] + [next_single_obs[env_ids]]
+        ideal_hist = torch.cat(ideal_frames, dim=-1)
+
+        return {
+            "env_ids": env_ids.detach().clone(),
+            "current_hist_head": current_hist[:, :16].detach().clone(),
+            "ideal_hist_head": ideal_hist[:, :16].detach().clone(),
+            "history_max_abs_diff": (current_hist - ideal_hist).abs().amax(dim=-1).detach().clone(),
+            "last_lower_action_norm": self._last_lower_action[env_ids].norm(dim=-1).detach().clone()
+            if self._last_lower_action is not None
+            else torch.zeros(env_ids.numel(), device=self.device, dtype=next_single_obs.dtype),
+        }
 
     @torch.no_grad()
     def predict(self, obs_dict: dict, nav_cmd: torch.Tensor) -> torch.Tensor:
@@ -107,6 +165,27 @@ class GrootLowLevelPolicy:
         single_obs = self._build_obs(proprio, nav_cmd)  # (N, 86)
         full_obs = self._stack_history(single_obs)  # (N, 516)
 
+        if self._baseline_single_obs is None:
+            self._baseline_single_obs = single_obs.detach().clone()
+            self._baseline_full_obs = full_obs.detach().clone()
+        elif self._pending_reset_env_ids is not None and not self._pending_reset_compare_printed:
+            env_ids = self._pending_reset_env_ids.reshape(-1)
+            if env_ids.numel() > 0:
+                baseline_single = self._baseline_single_obs[env_ids]
+                baseline_full = self._baseline_full_obs[env_ids]
+                single_diff = (single_obs[env_ids] - baseline_single).abs().amax(dim=-1)
+                full_diff = (full_obs[env_ids] - baseline_full).abs().amax(dim=-1)
+                print("[LOW-LEVEL RESET INPUT COMPARE]")
+                print(f"  env_ids={env_ids.tolist()}")
+                print(f"  single_obs_max_abs_diff={single_diff.tolist()}")
+                print(f"  full_obs_max_abs_diff={full_diff.tolist()}")
+                print(f"  baseline_single_head[0]={baseline_single[0, :16].tolist()}")
+                print(f"  reset_single_head[0]={single_obs[env_ids][0, :16].tolist()}")
+                print(f"  baseline_full_tail_head[0]={baseline_full[0, -16:].tolist()}")
+                print(f"  reset_full_tail_head[0]={full_obs[env_ids][0, -16:].tolist()}")
+            self._pending_reset_compare_printed = True
+            self._pending_reset_env_ids = None
+
         # Select walk vs balance per-env
         nav_norm = torch.norm(nav_cmd, dim=-1)  # (N,)
         use_walk = nav_norm >= 0.05
@@ -127,7 +206,7 @@ class GrootLowLevelPolicy:
         Proprio layout (111D):
             [0:3]   base_lin_vel
             [3:6]   base_ang_vel
-            [6:9]   velocity_commands
+            [6:9]   velocity_commands (3D)
             [9:12]  projected_gravity
             [12:45] joint_pos_rel (33)
             [45:78] joint_vel_rel (33)
@@ -247,14 +326,19 @@ class GrootLowLevelPolicy:
     def _stack_history(self, single_obs: torch.Tensor) -> torch.Tensor:
         """Stack 6 frames of history → (N, 516).
 
-        On the first call after reset, pads with zeros.
-        Oldest frame first, newest last.
+        Matches the adapter's behavior: append current obs, then left-pad
+        with zeros to fill the history buffer. This is critical because
+        GR00T's estimator expects zero-padded initial history frames.
         """
         if self._obs_history is None:
-            self._obs_history = [torch.zeros_like(single_obs)] * GR00T_HISTORY_LEN
-        self._obs_history.append(single_obs)
+            self._obs_history = []
+        self._obs_history.append(single_obs.detach().clone())
+        # Left-pad with zero frames (same as adapter's appendleft)
+        while len(self._obs_history) < GR00T_HISTORY_LEN:
+            self._obs_history.insert(0, torch.zeros_like(single_obs))
+        # Keep only the last 6 frames
         if len(self._obs_history) > GR00T_HISTORY_LEN:
-            self._obs_history.pop(0)
+            self._obs_history = self._obs_history[-GR00T_HISTORY_LEN:]
         return torch.cat(self._obs_history, dim=-1)
 
     # ── Action mapping ─────────────────────────────────────────────────────

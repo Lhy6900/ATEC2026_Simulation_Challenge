@@ -5,10 +5,12 @@ Implementation of Task D environment configuration with different robots.
 """
 
 import copy
+from isaaclab.envs import mdp
 from isaaclab.utils import configclass
 import atec_rl_lab.tasks.task_d.mdp as atec_mdp
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.sensors import MultiMeshRayCasterCfg
@@ -123,6 +125,29 @@ class TaskDEnvCfg(BaseEnvCfg):
         # Task D reward
         self.rewards = RewardsCfg()
         self.terminations = TaskDTerminationsCfg()
+        self.events.reset_box_root = EventTerm(
+            func=mdp.reset_root_state_uniform,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("box"),
+                "pose_range": {
+                    "x": (0.0, 0.0),
+                    "y": (0.0, 0.0),
+                    "z": (0.0, 0.0),
+                    "roll": (0.0, 0.0),
+                    "pitch": (0.0, 0.0),
+                    "yaw": (0.0, 0.0),
+                },
+                "velocity_range": {
+                    "x": (0.0, 0.0),
+                    "y": (0.0, 0.0),
+                    "z": (0.0, 0.0),
+                    "roll": (0.0, 0.0),
+                    "pitch": (0.0, 0.0),
+                    "yaw": (0.0, 0.0),
+                },
+            },
+        )
 
         # Turn off the DR and noise
         self.observations.proprio.enable_corruption = False
