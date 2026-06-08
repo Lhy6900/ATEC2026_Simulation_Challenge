@@ -5,6 +5,7 @@ atec_robot_model.zip
 video
 logs
 tmp
+.worktrees/
 
 # C++
 **/cmake-build*/
@@ -81,4 +82,3 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
-
