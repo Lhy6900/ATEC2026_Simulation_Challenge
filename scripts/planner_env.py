@@ -45,37 +45,39 @@ OBSTACLE_RECT_CENTER_W = (
     0.5 * (OBSTACLE_RECT_Y_RANGE[0] + OBSTACLE_RECT_Y_RANGE[1]),
 )
 OBSTACLE_RECT_MARGIN = 0.5
-REWARD_BOX_PIT_WEIGHT = 4.0
-REWARD_BOX_PIT_DISTANCE_SCALE = 1.0  #2.0
+
+# Current reward weights/scales used by _compute_reward().
+REWARD_BOX_PIT_WEIGHT = 3.0  #2.0
+REWARD_BOX_PIT_DISTANCE_SCALE = 1.0
 BOX_PIT_GATE_FULL_DISTANCE = 0.8
 BOX_PIT_GATE_ZERO_DISTANCE = 1.2
 BOX_PIT_GATE_FLOOR = 0.1
+REWARD_APPROACH_WEIGHT = 35.0
+REWARD_ROBOT_BOX_WEIGHT = 0.2
+REWARD_ROBOT_BOX_DISTANCE_SCALE = 0.9
+REWARD_BOX_IN_PIT_WEIGHT = 500.0
+OBSTACLE_PENALTY_WEIGHT = 0.001
+REWARD_ALIVE = 0.01
+REWARD_TIME = -0.001
+REWARD_ACTION_RATE_WEIGHT = -0.01
+REWARD_NAV_CMD_CHANGE_WEIGHT = -0.005
+
+# Planner done/metric helper thresholds. These are not part of the reward total.
 BOX_XZ_PLANE_NEAR_PIT_FULL_DISTANCE = 0.5
 BOX_XZ_PLANE_NEAR_PIT_ZERO_DISTANCE = 2.0
 BOX_XZ_PLANE_METRIC_THRESHOLD = 0.8
-POST_PIT_HOLD_STEPS = 150
+POST_PIT_HOLD_STEPS = 0 # 150
 ROBOT_STABLE_Z_THRESHOLD = 0.25
-REWARD_APPROACH_WEIGHT = 35.0
-REWARD_ROBOT_BOX_WEIGHT = 0.2   # 0.3
-REWARD_ROBOT_BOX_DISTANCE_SCALE = 0.8  #0.9
-REWARD_BOX_IN_PIT_WEIGHT = 500.0
 REWARD_BOX_XZ_PLANE_WEIGHT = 1.0
 REWARD_BOX_IN_PIT_ALIGN_BONUS_WEIGHT = 75.0
 REWARD_STABLE_AFTER_PIT_WEIGHT = 1.0
-OBSTACLE_PENALTY_WEIGHT = 0.001
-REWARD_ALIVE = 0.01  #0.2
-REWARD_TIME = -0.005
-REWARD_ACTION_RATE_WEIGHT = -0.01
-REWARD_NAV_CMD_CHANGE_WEIGHT = -0.005
+
 REWARD_COMPONENT_KEYS = (
     "box_pit",
     "box_pit_gate",
     "approach",
     "robot_box",
     "box_in_pit",
-    "box_y_axis_xz_plane",
-    "box_in_pit_align_bonus",
-    "stable_after_pit",
     "obstacle",
     "alive",
     "time",
@@ -116,7 +118,6 @@ class PlannerEnv(gym.Wrapper):
 
         # State
         self._current_obs: dict | None = None
-        self._prev_box_pos_local: torch.Tensor | None = None
         self._prev_box_pos_w: torch.Tensor | None = None
         self._box_in_pit_given: torch.Tensor | None = None
         self._box_in_pit_latched: torch.Tensor | None = None
@@ -149,7 +150,6 @@ class PlannerEnv(gym.Wrapper):
         self._last_planner_action = torch.zeros(self.num_envs, 3, device=self.device)
         self._nav_cmd = torch.zeros(self.num_envs, 3, device=self.device)
         self._episode_step_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._prev_box_pos_local = self._box_pos_local()
         self._prev_box_pos_w = self.unwrapped.scene["box"].data.root_pos_w.detach().clone()
         self._post_reset_sync_compare_printed = False
         self._done_reason_printed = False
@@ -265,10 +265,8 @@ class PlannerEnv(gym.Wrapper):
             proprio = self._current_obs["proprio"]
             single_obs = self.low_level._build_obs(proprio, torch.zeros_like(nav_cmd))
             self.low_level.reset_envs(done_ids, single_obs)
-            self._prev_box_pos_local = self._box_pos_local()
             self._prev_box_pos_w = self.unwrapped.scene["box"].data.root_pos_w.detach().clone()
         else:
-            self._prev_box_pos_local = self._box_pos_local()
             self._prev_box_pos_w = self.unwrapped.scene["box"].data.root_pos_w.detach().clone()
 
         return self._build_planner_obs(self._current_obs), reward, terminated, truncated, info
@@ -630,77 +628,60 @@ class PlannerEnv(gym.Wrapper):
     # ── Reward computation ──────────────────────────────────────────────────
 
     def _compute_reward(self, prev_action: torch.Tensor, prev_nav_cmd: torch.Tensor, nav_cmd: torch.Tensor) -> torch.Tensor:
-        box_local = self._box_pos_local()
+        robot_xy_w = self.unwrapped.scene["robot"].data.root_pos_w[:, :2]
+        box_xy_w = self.unwrapped.scene["box"].data.root_pos_w[:, :2]
+        prev_box_xy_w = self._prev_box_pos_w[:, :2]
 
-        # Robot → box distance (exp shaped, always positive)
-        robot_local = self._robot_pos_local()
-        robot_box = torch.norm(robot_local[:, :2] - box_local[:, :2], dim=-1).clamp(max=3.0)
+        # Box -> pit distance and one-step positive progress.
+        dist = self._box_to_pit_distance_xy(box_xy_w)
+        prev_dist = self._box_to_pit_distance_xy(prev_box_xy_w)
+        approach = (prev_dist - dist).clamp(min=0)
+
+        # Robot -> box distance.
+        robot_box = torch.norm(robot_xy_w - box_xy_w, dim=-1).clamp(max=3.0)
         box_pit_gate = self._box_pit_gate(robot_box)
 
-        # Box → target pit rectangle distance (exp shaped, always positive)
-        box_xy_w = self.unwrapped.scene["box"].data.root_pos_w[:, :2]
-        dist = self._box_to_pit_distance_xy(box_xy_w)
-        box_pit_reward = box_pit_gate * REWARD_BOX_PIT_WEIGHT * torch.exp(-dist / REWARD_BOX_PIT_DISTANCE_SCALE)
-
-        # Reward only positive progress toward the pit, matching the restored 9000-iteration run.
-        prev_dist = self._box_to_pit_distance_xy(self._prev_box_pos_w[:, :2])
-        progress = prev_dist - dist
-        approach = progress.clamp(min=0)
-
-        robot_box_reward = REWARD_ROBOT_BOX_WEIGHT * torch.exp(-robot_box / REWARD_ROBOT_BOX_DISTANCE_SCALE)
-
-        # Box in pit (one-time reward)
+        # Box in pit (one-time reward).
         box_in_pit_reward = self._box_in_pit_success_reward()
-        box_entry_mask = box_in_pit_reward / REWARD_BOX_IN_PIT_WEIGHT
-        box_y_axis_xz_plane = self._box_y_axis_xz_plane_score()
-        box_y_axis_xz_plane_reward = (
-            REWARD_BOX_XZ_PLANE_WEIGHT
-            * self._box_xz_plane_near_pit_gate(dist)
-            * box_y_axis_xz_plane
-        )
-        box_in_pit_align_bonus = (
-            REWARD_BOX_IN_PIT_ALIGN_BONUS_WEIGHT
-            * box_entry_mask
-            * box_y_axis_xz_plane
-        )
-        stable_after_pit_reward = self._stable_after_pit_reward()
 
-        # Obstacle penalty
-        robot_xy_w = self.unwrapped.scene["robot"].data.root_pos_w[:, :2]
+        # Obstacle penalty.
         obstacle_pen = self._obstacle_rect_penalty_xy(robot_xy_w) + self._obstacle_rect_penalty_xy(box_xy_w)
 
-        # Smoothness penalties
+        # Smoothness penalties.
         action_rate = torch.sum((self._last_planner_action - prev_action) ** 2, dim=-1)
         nav_cmd_change = torch.sum((nav_cmd - prev_nav_cmd) ** 2, dim=-1)
+
+        box_pit_reward = box_pit_gate * REWARD_BOX_PIT_WEIGHT * torch.exp(-dist / REWARD_BOX_PIT_DISTANCE_SCALE)
+        approach_reward = REWARD_APPROACH_WEIGHT * approach
+        robot_box_reward = REWARD_ROBOT_BOX_WEIGHT * torch.exp(-robot_box / REWARD_ROBOT_BOX_DISTANCE_SCALE)
+        obstacle_reward = -OBSTACLE_PENALTY_WEIGHT * obstacle_pen
+        alive_reward = torch.full_like(dist, REWARD_ALIVE)
+        time_reward = torch.full_like(dist, REWARD_TIME)
+        action_rate_reward = REWARD_ACTION_RATE_WEIGHT * action_rate
+        nav_cmd_change_reward = REWARD_NAV_CMD_CHANGE_WEIGHT * nav_cmd_change
 
         components = {
             "box_pit": box_pit_reward,
             "box_pit_gate": box_pit_gate,
-            "approach": REWARD_APPROACH_WEIGHT * approach,
+            "approach": approach_reward,
             "robot_box": robot_box_reward,
             "box_in_pit": box_in_pit_reward,
-            "box_y_axis_xz_plane": box_y_axis_xz_plane_reward,
-            "box_in_pit_align_bonus": box_in_pit_align_bonus,
-            "stable_after_pit": stable_after_pit_reward,
-            "obstacle": -OBSTACLE_PENALTY_WEIGHT * obstacle_pen,
-            "alive": torch.full_like(box_pit_reward, REWARD_ALIVE),
-            "time": torch.full_like(box_pit_reward, REWARD_TIME),
-            "action_rate": REWARD_ACTION_RATE_WEIGHT * action_rate,
-            "nav_cmd_change": REWARD_NAV_CMD_CHANGE_WEIGHT * nav_cmd_change,
+            "obstacle": obstacle_reward,
+            "alive": alive_reward,
+            "time": time_reward,
+            "action_rate": action_rate_reward,
+            "nav_cmd_change": nav_cmd_change_reward,
         }
         total_reward = (
             box_pit_reward
-            + REWARD_APPROACH_WEIGHT * approach
+            + approach_reward
             + robot_box_reward
-            + box_in_pit_reward                     # positive, success
-            + box_y_axis_xz_plane_reward            # positive, keep long edge in world xz-plane near pit
-            + box_in_pit_align_bonus                # positive, prefer xz-plane pit entry
-            + stable_after_pit_reward               # positive, post-pit stability
-            - OBSTACLE_PENALTY_WEIGHT * obstacle_pen
-            + REWARD_ALIVE
-            + REWARD_TIME
-            + REWARD_ACTION_RATE_WEIGHT * action_rate
-            + REWARD_NAV_CMD_CHANGE_WEIGHT * nav_cmd_change
+            + box_in_pit_reward
+            + obstacle_reward
+            + alive_reward
+            + time_reward
+            + action_rate_reward
+            + nav_cmd_change_reward
         )
         components["total"] = total_reward
         self._last_reward_components = components

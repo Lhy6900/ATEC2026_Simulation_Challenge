@@ -161,12 +161,10 @@ class PlannerOnPolicyRunner(OnPolicyRunner):
     }
     _REWARD_COMPONENT_LABELS = {
         "box_pit": "Mean reward/box_pit",
+        "box_pit_gate": "Mean reward/box_pit_gate",
         "approach": "Mean reward/approach",
         "robot_box": "Mean reward/robot_box",
         "box_in_pit": "Mean reward/box_in_pit",
-        "box_y_axis_xz_plane": "Mean reward/box_y_axis_xz_plane",
-        "box_in_pit_align_bonus": "Mean reward/box_in_pit_align_bonus",
-        "stable_after_pit": "Mean reward/stable_after_pit",
         "obstacle": "Mean reward/obstacle",
         "alive": "Mean reward/alive",
         "time": "Mean reward/time",

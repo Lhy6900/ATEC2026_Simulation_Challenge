@@ -37,7 +37,7 @@ HEIGHT_DEFAULT = 0.74
 HEIGHT_STEP = 0.02
 
 # Fixed command targets while keys are held.
-VX_FORWARD_CMD = 0.6
+VX_FORWARD_CMD = 0.75
 VX_BACKWARD_CMD = 0.35
 VY_CMD = 0.35
 VYAW_CMD = 0.75

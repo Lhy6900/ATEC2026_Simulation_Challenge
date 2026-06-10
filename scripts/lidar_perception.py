@@ -175,19 +175,15 @@ class LidarPoseStabilizer:
 
         prev = self._box_world
         pos_delta = float(np.linalg.norm(measurement.xyz_w[:2] - prev.xyz_w[:2]))
-        anchor_xyz = self._box_world_anchor_xyz if self._box_world_anchor_xyz is not None else prev.xyz_w
-        anchor_delta_xy = measurement.xyz_w[:2] - anchor_xyz[:2]
-        yaw_reference = self._box_yaw_anchor if self._box_yaw_anchor is not None else prev.yaw_w
-        yaw_delta_anchor = axis_yaw_error(measurement.yaw_w, yaw_reference)
         yaw_delta_prev = axis_yaw_error(measurement.yaw_w, prev.yaw_w)
-        anchor_ok = abs(float(anchor_delta_xy[0])) <= 0.18 and abs(float(anchor_delta_xy[1])) <= 0.09
-        pos_ok = pos_delta <= 0.75 and anchor_ok and not swapped_axis
-        yaw_ok = yaw_delta_anchor <= self.max_anchor_yaw_error and yaw_delta_prev <= self.max_yaw_step
+        pos_ok = pos_delta <= 3.0 and not swapped_axis
+        yaw_ok = yaw_delta_prev <= self.max_yaw_step
 
         # A bad box yaw normally means the visible patch was explained with the
         # wrong rectangle axis; the inferred center is then biased as well.
         if pos_ok and yaw_ok:
-            pos_trust = 0.20 + 0.50 * max(0.0, min(1.0, estimate.confidence))
+            base_trust = 0.20 + 0.50 * max(0.0, min(1.0, estimate.confidence))
+            pos_trust = min(0.8, base_trust + 0.3 * min(1.0, pos_delta / 1.0))
             xyz_w = prev.xyz_w + pos_trust * (measurement.xyz_w - prev.xyz_w)
         else:
             xyz_w = prev.xyz_w.copy()
@@ -196,10 +192,7 @@ class LidarPoseStabilizer:
             yaw_trust = min(0.10, 0.02 + 0.08 * max(0.0, min(1.0, estimate.confidence)))
             yaw_w = blend_continuous_axis_yaw(prev.yaw_w, measurement.yaw_w, yaw_trust)
         else:
-            # Do not freeze to a bad single-frame yaw; stay on the world-frame track.
             yaw_w = prev.yaw_w
-        if self._box_yaw_anchor is not None:
-            yaw_w = blend_continuous_axis_yaw(yaw_w, self._box_yaw_anchor, 0.01)
 
         message = "stabilized" if pos_ok and yaw_ok else "predicted_outlier"
         confidence = estimate.confidence if pos_ok and yaw_ok else min(estimate.confidence, prev.estimate.confidence * 0.90)
@@ -208,6 +201,16 @@ class LidarPoseStabilizer:
             yaw_w=float(yaw_w),
             estimate=replace(estimate, confidence=confidence, message=message),
         )
+        if self._box_world_anchor_xyz is not None:
+            anchor_drift = 0.03
+            self._box_world_anchor_xyz = (
+                (1.0 - anchor_drift) * self._box_world_anchor_xyz
+                + anchor_drift * xyz_w
+            ).astype(np.float32, copy=False)
+        if pos_ok and yaw_ok and self._box_yaw_anchor is not None:
+            self._box_yaw_anchor = blend_continuous_axis_yaw(
+                self._box_yaw_anchor, measurement.yaw_w, 0.03
+            )
         return self._track_to_lidar_estimate(self._box_world, sensor_pos, sensor_quat, message)
 
     def _update_ditch_world(
