@@ -262,31 +262,16 @@ def _filter_compatible_state_dict(policy, state_dict):
 
 
 def _build_policy(env, checkpoint_path, device):
-    import torch
-    from rsl_rl.modules import ActorCritic
-
     obs = env.get_observations()
-    policy = ActorCritic(
-        obs=obs,
-        obs_groups=OBS_GROUPS,
-        num_actions=PLANNER_NUM_ACTIONS,
-        actor_obs_normalization=POLICY_CFG["actor_obs_normalization"],
-        critic_obs_normalization=POLICY_CFG["critic_obs_normalization"],
-        actor_hidden_dims=POLICY_CFG["actor_hidden_dims"],
-        critic_hidden_dims=POLICY_CFG["critic_hidden_dims"],
+    from scripts.planner_inference_policy import load_planner_inference_policy
+
+    return load_planner_inference_policy(
+        checkpoint_path,
+        device=device,
+        expected_obs_dim=obs["policy"].shape[-1],
+        expected_action_dim=PLANNER_NUM_ACTIONS,
         activation=POLICY_CFG["activation"],
-        init_noise_std=POLICY_CFG["init_noise_std"],
-        noise_std_type=POLICY_CFG["noise_std_type"],
     )
-    loaded = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = loaded["model_state_dict"] if "model_state_dict" in loaded else loaded
-    state_dict, skipped_keys = _filter_compatible_state_dict(policy, state_dict)
-    if skipped_keys:
-        print(f"[INFO] Skipped {len(skipped_keys)} incompatible checkpoint tensor(s): {', '.join(skipped_keys)}")
-    policy.load_state_dict(state_dict, strict=False)
-    policy.to(device)
-    policy.eval()
-    return policy
 
 
 def _evaluate_checkpoint(env, policy, target_done_count: int, max_steps: int) -> dict[str, float]:
