@@ -62,14 +62,14 @@ REWARD_TIME = -0.001
 REWARD_ACTION_RATE_WEIGHT = -0.01
 REWARD_NAV_CMD_CHANGE_WEIGHT = -0.005
 
-# Planner done/metric helper thresholds. These are not part of the reward total.
-BOX_XZ_PLANE_NEAR_PIT_FULL_DISTANCE = 0.5
-BOX_XZ_PLANE_NEAR_PIT_ZERO_DISTANCE = 2.0
+# Planner done/metric helper thresholds.
+BOX_XZ_PLANE_NEAR_PIT_FULL_DISTANCE = 1.5
+BOX_XZ_PLANE_NEAR_PIT_ZERO_DISTANCE = 3.0
 BOX_XZ_PLANE_METRIC_THRESHOLD = 0.8
 POST_PIT_HOLD_STEPS = 0 # 150
 ROBOT_STABLE_Z_THRESHOLD = 0.25
-REWARD_BOX_XZ_PLANE_WEIGHT = 1.0
-REWARD_BOX_IN_PIT_ALIGN_BONUS_WEIGHT = 75.0
+REWARD_BOX_XZ_PLANE_WEIGHT = 2.0
+REWARD_BOX_IN_PIT_ALIGN_BONUS_WEIGHT = 250.0
 REWARD_STABLE_AFTER_PIT_WEIGHT = 1.0
 
 REWARD_COMPONENT_KEYS = (
@@ -78,6 +78,8 @@ REWARD_COMPONENT_KEYS = (
     "approach",
     "robot_box",
     "box_in_pit",
+    "box_y_axis_xz_plane",
+    "box_in_pit_align_bonus",
     "obstacle",
     "alive",
     "time",
@@ -643,6 +645,18 @@ class PlannerEnv(gym.Wrapper):
 
         # Box in pit (one-time reward).
         box_in_pit_reward = self._box_in_pit_success_reward()
+        box_entry_mask = box_in_pit_reward / REWARD_BOX_IN_PIT_WEIGHT
+        box_y_axis_xz_plane_score = self._box_y_axis_xz_plane_score()
+        box_y_axis_xz_plane_reward = (
+            REWARD_BOX_XZ_PLANE_WEIGHT
+            * self._box_xz_plane_near_pit_gate(dist)
+            * box_y_axis_xz_plane_score
+        )
+        box_in_pit_align_bonus = (
+            REWARD_BOX_IN_PIT_ALIGN_BONUS_WEIGHT
+            * box_entry_mask
+            * box_y_axis_xz_plane_score
+        )
 
         # Obstacle penalty.
         obstacle_pen = self._obstacle_rect_penalty_xy(robot_xy_w) + self._obstacle_rect_penalty_xy(box_xy_w)
@@ -666,6 +680,8 @@ class PlannerEnv(gym.Wrapper):
             "approach": approach_reward,
             "robot_box": robot_box_reward,
             "box_in_pit": box_in_pit_reward,
+            "box_y_axis_xz_plane": box_y_axis_xz_plane_reward,
+            "box_in_pit_align_bonus": box_in_pit_align_bonus,
             "obstacle": obstacle_reward,
             "alive": alive_reward,
             "time": time_reward,
@@ -677,6 +693,8 @@ class PlannerEnv(gym.Wrapper):
             + approach_reward
             + robot_box_reward
             + box_in_pit_reward
+            + box_y_axis_xz_plane_reward
+            + box_in_pit_align_bonus
             + obstacle_reward
             + alive_reward
             + time_reward
