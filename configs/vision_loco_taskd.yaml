@@ -1,0 +1,110 @@
+# TaskD 推箱子后视觉运控阶段参数
+# 这个文件只控制脚本/算法侧逻辑，不修改考题环境。
+
+startup_motion:
+  # 是否开启开局预动作。开启后，在高层推箱子策略接管前，先直接给推箱子底层运控发送固定速度命令。
+  enabled: false
+  # startup 阶段如果底层环境返回 terminated/truncated，是否立刻停止后续预动作。默认 false，保证三段命令顺序触发。
+  stop_on_done: false
+  # 开局后退多少个仿真 step。0 表示跳过这一段。
+  back_steps: 100
+  # 开局向左移动多少个仿真 step。0 表示跳过这一段。
+  left_steps: 500
+  # 开局向前移动多少个仿真 step。0 表示跳过这一段。
+  forward_steps: 0
+  # 后退阶段发送给推箱子底层运控的速度命令 [vx, vy, wz]，单位分别为 m/s、m/s、rad/s。
+  back_command: [-0.2, 0.0, 0.0]
+  # 左移阶段发送给推箱子底层运控的速度命令 [vx, vy, wz]。+y 表示机器人左方。
+  left_command: [0.2, 0.5, -0.15]
+  # 前进阶段发送给推箱子底层运控的速度命令 [vx, vy, wz]。
+  forward_command: [0.4, 0.0, 0.1]
+
+switch:
+  # 是否开局直接使用视觉运控策略。true 时跳过 startup_motion 和推箱子高层策略，直接按 loco.forward_velocity 往前走。
+  start_with_vision_loco: false
+  # start_with_vision_loco=true 时，开局先执行多少个 settle step。默认 0 表示立刻前进。
+  start_with_vision_loco_settle_steps: 0
+  # 箱子连续多少个仿真 step 被判定在沟里后，切换到视觉运控策略。
+  box_in_pit_hold_steps: 1
+  # 箱子入沟后，继续用推箱子底层策略执行多少个 step 的指定速度命令，再切换到视觉运控策略。
+  settle_steps_after_switch: 50
+  # settle 阶段发送给推箱子底层策略的速度命令 [vx, vy, wz]，单位分别为 m/s、m/s、rad/s。
+  settle_command: [-0.0, 0.2, 0]
+
+loco:
+  # 视觉运控策略 TorchScript 模型路径。相对路径以 ATEC2026_Simulation_Challenge 为根目录。
+  policy_path: ../loco_policy/policy.pt
+  # 视觉运控策略导出的关节顺序/default metadata。
+  metadata_path: ../loco_policy/sim2sim_metadata.json
+  # 切换后给视觉运控策略的前向速度命令，单位 m/s。
+  forward_velocity: 0.9
+  # yaw 回正比例系数：vyaw = clamp(-yaw_kp * 当前世界 yaw, -1, 1)。
+  yaw_kp: 0.0
+
+action_compensation:
+  # 是否按训练环境和 TaskD 环境的 kp/kd 差异，反算 TaskD 下的等效目标角。
+  enabled: true
+  # 0 表示不补偿，1 表示完全按 PD 等效公式补偿。走路发抖时可先降到 0.5。
+  blend: 1.0
+  # 单关节额外目标角补偿限幅，单位 rad。填 null 表示不限幅。
+  max_extra_target_delta: 0.5
+
+ditch:
+  # 沟宽，单位 m。填 null 时使用 TaskD-G1 环境配置里的 pit_width_range[0]。
+  width: null
+  # 沟在长度方向的可通行长度，单位 m。默认会被 TaskD terrain 的 open ditch 几何覆盖。
+  length: 7.0
+  # 沟深，单位 m。沟内散点高度会按 -depth 计算。
+  depth: 1.0
+  # 沟长度方向相对世界 +x 的 yaw，单位 degree。TaskD 中沟沿世界 y 方向，所以是 90。
+  yaw_deg: 90.0
+  # 可选：手动指定世界系沟中心 [x, y]。填 null 时从 TaskD terrain/env_origins 自动推导 open ditch 中心。
+  center_xy: null
+
+height_map:
+  # 是否禁用切换视觉运控后的高程图打印。
+  no_print: false
+  # 高程图打印间隔。0 表示只在切换后第一次打印；大于 0 表示每隔 N 个视觉运控 step 打印一次。
+  print_interval: 2
+  # 打印中心 crop 的窗口大小，必须为正数；偶数会自动减 1 变成奇数。
+  print_window: 11
+
+  force_ground_behind:
+    # 是否开启：机器人坐标系下 x <= x_max 且 y 在 [y_min, y_max] 的散点强制为平地。默认关闭以对齐 loco_policy/observations.py。
+    enabled: false
+    # 机器人坐标系 x 上限，单位 m。默认 x<=0 表示机器人后方/脚下中线区域。
+    x_max: 0.1
+    # 机器人坐标系 y 下限，单位 m。
+    y_min: -0.4
+    # 机器人坐标系 y 上限，单位 m。
+    y_max: 0.4
+
+  after_gap:
+    # 是否开启：base 走过 gap 后，整张合成高程图强制为平地。
+    enabled: false
+    # 过沟判定余量，单位 m。0 表示 base 越过沟后沿立即触发；正数会更晚触发。
+    margin: 0.0
+    # base 走过 gap 后覆盖发送给视觉运控策略的速度命令 [vx, vy, wz]。null 表示继续使用 loco.forward_velocity/yaw_kp。
+    vel_command: [0.8,0.0,0.22]
+
+  in_gap_raise_forward_ground:
+    # 是否开启：base 在沟内时，把前方非沟平地临时抬高。
+    enabled: false
+    # base 在沟内时，机器人坐标系下 x > x_min 且非沟内的散点会被抬高。
+    x_min: 0.0
+    # 抬高量，单位 m。base 离开沟后这个效果立即消失。
+    height: 0.12
+
+  box_fill:
+    # 是否把已经落入沟内的箱子顶面合成进高程图。
+    enabled: true
+    # TaskD G1 箱子尺寸，单位 m，对应 env_cfg.py 的 CuboidCfg size=(0.8, 1.0, 0.6)。
+    size_x: 0.8
+    size_y: 1.0
+    height: 0.6
+    # 足迹边缘余量，避免网格采样刚好卡在箱子边缘时闪烁。
+    margin: 0.05
+
+success:
+  # 仅用于日志提示：机器人世界系 x 大于该阈值时打印 crossed。
+  cross_x_threshold: 3.5
