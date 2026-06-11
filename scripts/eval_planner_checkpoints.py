@@ -320,50 +320,48 @@ def main():
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
-    try:
-        import torch
-        from source.atec_rl_lab.atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvG1Cfg
-        from scripts.low_level_policy import GrootLowLevelPolicy
-        from scripts.planner_env import PlannerEnv
 
-        env_cfg = TaskDEnvG1Cfg()
-        env_cfg.scene.num_envs = args.num_envs
-        env_cfg.episode_length_s = args.episode_length_s
-        env_cfg.terminations.x_reached = None
-        env_cfg.rewards.achieve = None
-        env_cfg.rewards.box_in_target_x = None
-        env_cfg.events.reset_robot_joints = None
-        env_cfg = _configure_training_reset_ranges(env_cfg, taskd_initpos=args.taskD_initpos)
+    import torch
+    from source.atec_rl_lab.atec_rl_lab.tasks.task_d.env_cfg import TaskDEnvG1Cfg
+    from scripts.low_level_policy import GrootLowLevelPolicy
+    from scripts.planner_env import PlannerEnv
 
-        env_cfg.scene.head_camera = None
-        env_cfg.scene.ee_camera = None
-        env_cfg.scene.ee_dual_camera = None
-        env_cfg.observations.image.head_rgb = None
-        env_cfg.observations.image.head_depth = None
-        env_cfg.observations.image.ee_rgb = None
-        env_cfg.observations.image.ee_depth = None
-        env_cfg.observations.image.ee_dual_rgb = None
-        env_cfg.observations.image.ee_dual_depth = None
+    env_cfg = TaskDEnvG1Cfg()
+    env_cfg.scene.num_envs = args.num_envs
+    env_cfg.episode_length_s = args.episode_length_s
+    env_cfg.terminations.x_reached = None
+    env_cfg.rewards.achieve = None
+    env_cfg.rewards.box_in_target_x = None
+    env_cfg.events.reset_robot_joints = None
+    env_cfg = _configure_training_reset_ranges(env_cfg, taskd_initpos=args.taskD_initpos)
 
-        low_level = GrootLowLevelPolicy(device="cuda:0")
-        env = PlannerEnv(env_cfg, low_level)
-        checkpoint_paths = _resolve_checkpoints(args.log_dir, args.checkpoint_steps, args.checkpoints)
+    env_cfg.scene.head_camera = None
+    env_cfg.scene.ee_camera = None
+    env_cfg.scene.ee_dual_camera = None
+    env_cfg.observations.image.head_rgb = None
+    env_cfg.observations.image.head_depth = None
+    env_cfg.observations.image.ee_rgb = None
+    env_cfg.observations.image.ee_depth = None
+    env_cfg.observations.image.ee_dual_rgb = None
+    env_cfg.observations.image.ee_dual_depth = None
 
-        print(f"Evaluating {len(checkpoint_paths)} checkpoint(s) with num_envs={args.num_envs}, target_done_count={args.target_done_count}")
-        for checkpoint_path in checkpoint_paths:
-            policy = _build_policy(env, str(checkpoint_path), env.device)
-            summary = _evaluate_checkpoint(env, policy, args.target_done_count, args.max_steps)
-            print("=" * 100)
-            print(checkpoint_path.name)
-            for key in sorted(summary):
-                value = summary[key]
-                if isinstance(value, float):
-                    print(f"{key}: {value:.6f}")
-                else:
-                    print(f"{key}: {value}")
-    finally:
-        if not args.skip_app_close:
-            simulation_app.close()
+    low_level = GrootLowLevelPolicy(device="cuda:0")
+    env = PlannerEnv(env_cfg, low_level)
+    checkpoint_paths = _resolve_checkpoints(args.log_dir, args.checkpoint_steps, args.checkpoints)
+
+    print(f"Evaluating {len(checkpoint_paths)} checkpoint(s) with num_envs={args.num_envs}, target_done_count={args.target_done_count}")
+    for checkpoint_path in checkpoint_paths:
+        policy = _build_policy(env, str(checkpoint_path), env.device)
+        summary = _evaluate_checkpoint(env, policy, args.target_done_count, args.max_steps)
+        print("=" * 100)
+        print(checkpoint_path.name)
+        for key in sorted(summary):
+            value = summary[key]
+            if isinstance(value, float):
+                print(f"{key}: {value:.6f}")
+            else:
+                print(f"{key}: {value}")
+
 
 
 if __name__ == "__main__":
