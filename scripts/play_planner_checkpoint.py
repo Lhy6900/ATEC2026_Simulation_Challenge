@@ -8,6 +8,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import sys
 import time
@@ -152,8 +153,8 @@ def main():
     parser.add_argument(
         "--vision_loco_cfg",
         type=Path,
-        default=PROJECT_ROOT / "configs" / "vision_loco_taskd.yaml",
-        help="YAML config for planner-to-vision-locomotion handoff.",
+        default=None,
+        help="Optional YAML override for planner-to-vision-locomotion handoff. Defaults to scripts/vision_loco_taskd_config.py.",
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
@@ -173,14 +174,19 @@ def main():
         from scripts.low_level_policy import GrootLowLevelPolicy
         from scripts.planner_env import PlannerEnv
         from scripts.vision_loco_policy import VisionLocoPolicy
+        from scripts.vision_loco_taskd_config import DEFAULT_VISION_LOCO_TASKD_CONFIG
 
         checkpoint = args.checkpoint.expanduser().resolve()
         if not checkpoint.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
-        vision_cfg_path = args.vision_loco_cfg.expanduser().resolve()
-        if not vision_cfg_path.exists():
-            raise FileNotFoundError(f"Vision locomotion config not found: {vision_cfg_path}")
-        vision_cfg = _load_yaml_config(vision_cfg_path)
+        vision_cfg_path = None
+        if args.vision_loco_cfg is None:
+            vision_cfg = copy.deepcopy(DEFAULT_VISION_LOCO_TASKD_CONFIG)
+        else:
+            vision_cfg_path = args.vision_loco_cfg.expanduser().resolve()
+            if not vision_cfg_path.exists():
+                raise FileNotFoundError(f"Vision locomotion config not found: {vision_cfg_path}")
+            vision_cfg = _load_yaml_config(vision_cfg_path)
         startup_cfg = _section(vision_cfg, "startup_motion")
         switch_cfg = _section(vision_cfg, "switch")
         loco_cfg = _section(vision_cfg, "loco")
@@ -225,7 +231,10 @@ def main():
         obs_dict, _ = env.reset()
         print(f"[play] Loaded checkpoint: {checkpoint}")
         print(f"[play] Loaded vision locomotion policy: {loco_policy_path}")
-        print(f"[play] Loaded vision locomotion config: {vision_cfg_path}")
+        if vision_cfg_path is None:
+            print("[play] Loaded built-in vision locomotion config: scripts/vision_loco_taskd_config.py")
+        else:
+            print(f"[play] Loaded vision locomotion config override: {vision_cfg_path}")
         print("[play] Control mode: planner until box-in-ditch, then synthetic-height-map vision locomotion.")
         print("[play] Close the Isaac Sim window or wait for --max_steps to exit.")
 
