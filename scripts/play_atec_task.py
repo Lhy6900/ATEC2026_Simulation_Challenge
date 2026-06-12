@@ -127,8 +127,8 @@ def play() -> tuple[float, float]:
             actions = resp["action"]
             actions = torch.tensor(actions, dtype=torch.float32, device='cuda').view(1, -1)
             obs, reward, terminated, truncated, info = env.step(actions)
-            if not is_task_e:
-                camera_follow(env)
+            # if not is_task_e:
+            #     camera_follow(env)
 
             sim_dt = info["Step_dt"]
             if isinstance(reward, torch.Tensor):
