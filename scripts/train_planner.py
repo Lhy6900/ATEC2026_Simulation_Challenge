@@ -3,8 +3,9 @@
 Usage:
     PYTHONPATH=. python scripts/train_planner.py --num_envs 1024 --headless
 
-The planner outputs [vx, vy, vyaw] at 50Hz, which is fed directly to the
-GR00T low-level locomotion policy (also running at 50Hz on GPU).
+The planner outputs relative [dvx, dvy, dvyaw] commands at 10Hz. Each command
+is integrated into nav_cmd and held while the GR00T low-level policy runs at
+50Hz on GPU.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from scripts.planner_env import PlannerEnv, PlannerRslRlWrapper  # noqa: E402
 TRAIN_CFG = {
     "seed": 42,
     "device": "cuda:0",
-    "num_steps_per_env": 100,  # 100 steps × 0.02s = 2s per rollout
+    "num_steps_per_env": 50,  # 50 planner steps × 0.1s = 5s per rollout
     "max_iterations": 10000,
     "save_interval": 200,
     "experiment_name": DEFAULT_EXPERIMENT_NAME,
@@ -165,6 +166,7 @@ class PlannerOnPolicyRunner(OnPolicyRunner):
         "approach": "Mean reward/approach",
         "robot_box": "Mean reward/robot_box",
         "box_in_pit": "Mean reward/box_in_pit",
+        "stable_after_pit": "Mean reward/stable_after_pit",
         "obstacle": "Mean reward/obstacle",
         "alive": "Mean reward/alive",
         "time": "Mean reward/time",

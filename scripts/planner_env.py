@@ -1,9 +1,9 @@
 """PlannerEnv: wraps ATEC TaskD-G1 for high-level planner training.
 
 Architecture:
-    Planner (PPO, 50Hz) → nav_cmd → GR00T (GPU TorchScript, 50Hz) → env action → ATEC Env
+    Planner (PPO, 10Hz) → nav_cmd → GR00T (GPU TorchScript, 50Hz) → env action → ATEC Env
 
-The planner runs at the same frequency as the low-level policy (decimation=1).
+The planner runs at 1/5 the low-level policy frequency (decimation=5).
 Observations are all GPU tensors. Critic receives GT privileged information.
 
 PlannerEnv inherits from gym.Wrapper so that .unwrapped correctly resolves
@@ -30,6 +30,7 @@ NAV_CMD_MIN = torch.tensor([-1.5, -0.75, -1.0])
 NAV_CMD_MAX = torch.tensor([1.5, 0.75, 1.0])
 # action → nav_cmd change scale
 ACTION_SCALE = 0.25
+PLANNER_DECIMATION = 5
 BOX_IN_PIT_Z_THRESHOLD = -0.2
 BOX_DROP_FAILURE_Z_THRESHOLD = 0.0
 PIT_TARGET_X_RANGE = (-0.5, 0.5)
@@ -66,7 +67,7 @@ REWARD_NAV_CMD_CHANGE_WEIGHT = -0.005
 BOX_XZ_PLANE_NEAR_PIT_FULL_DISTANCE = 1.5
 BOX_XZ_PLANE_NEAR_PIT_ZERO_DISTANCE = 3.0
 BOX_XZ_PLANE_METRIC_THRESHOLD = 0.8
-POST_PIT_HOLD_STEPS = 0 # 150
+POST_PIT_HOLD_STEPS = 30
 ROBOT_STABLE_Z_THRESHOLD = 0.25
 REWARD_BOX_XZ_PLANE_WEIGHT = 0.7
 REWARD_BOX_IN_PIT_ALIGN_BONUS_WEIGHT = 750.0
@@ -80,6 +81,7 @@ REWARD_COMPONENT_KEYS = (
     "box_in_pit",
     "box_y_axis_xz_plane",
     "box_in_pit_align_bonus",
+    "stable_after_pit",
     "obstacle",
     "alive",
     "time",
@@ -138,7 +140,7 @@ class PlannerEnv(gym.Wrapper):
 
     @property
     def max_episode_length(self):
-        return self.unwrapped.max_episode_length
+        return (self.unwrapped.max_episode_length + PLANNER_DECIMATION - 1) // PLANNER_DECIMATION
 
     # ── Core interface ──────────────────────────────────────────────────────
 
@@ -184,48 +186,138 @@ class PlannerEnv(gym.Wrapper):
         prev_action = self._last_planner_action
         self._last_planner_action = planner_action.detach().clone()
 
-        # Decimation=1: one planner step = one env step
-        low_action = self.low_level.predict(self._current_obs, nav_cmd)
+        reward = torch.zeros(self.num_envs, device=self.device)
+        reward_components: dict[str, torch.Tensor] | None = None
+        done_metric_parts: list[dict[str, torch.Tensor]] = []
+        info: dict = {}
+        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        raw_terminated = torch.zeros_like(terminated)
+        box_in_pit_now = torch.zeros_like(terminated)
+        post_pit_success_now = torch.zeros_like(terminated)
+        box_drop_failure_now = torch.zeros_like(terminated)
+        planner_done_reset = torch.zeros_like(terminated)
+        planner_success_reset = torch.zeros_like(terminated)
+        completed_substeps = 0
 
-        obs, _, terminated, truncated, info = self.env.step(low_action)
-        self._current_obs = obs
+        # One high-level planner step spans several 50Hz low-level/env steps.
+        # The planner action and nav_cmd are held constant during this window.
+        for substep in range(PLANNER_DECIMATION):
+            active = ~(terminated | truncated)
+            if not active.any():
+                break
 
-        # Planner-level termination: success after holding stable post-pit, or failure by falling elsewhere.
-        box_in_pit_now = self._check_box_in_pit()
-        _, post_pit_success_now = self._update_post_pit_state(box_in_pit_now)
-        box_drop_failure_now = self._check_box_drop_failure()
-        planner_done_now = post_pit_success_now | box_drop_failure_now
-        raw_terminated = terminated.clone()
-        planner_done_reset = self._planner_done_reset_mask(planner_done_now, raw_terminated, truncated)
-        planner_success_reset = self._planner_success_reset_mask(post_pit_success_now, raw_terminated, truncated)
-        terminated = terminated | planner_done_now
+            low_action = self.low_level.predict(self._current_obs, nav_cmd)
 
-        # Compute reward BEFORE resetting per-env state (needs prev box pos)
-        reward = self._compute_reward(prev_action, prev_nav_cmd, nav_cmd)
+            obs, _, raw_terminated_step, truncated_step, info = self.env.step(low_action)
+            self._current_obs = obs
+            completed_substeps += 1
 
-        # Reset per-env tracking state for environments that were auto-reset
+            raw_terminated_step = raw_terminated_step & active
+            truncated_step = truncated_step & active
+            box_drop_failure_step = self._check_box_drop_failure() & active
+            terminated_step = raw_terminated_step | box_drop_failure_step
+
+            smooth_prev_action = prev_action if substep == 0 else self._last_planner_action
+            smooth_prev_nav_cmd = prev_nav_cmd if substep == 0 else nav_cmd
+            step_reward = self._compute_reward(smooth_prev_action, smooth_prev_nav_cmd, nav_cmd)
+            reward = reward + torch.where(active, step_reward, torch.zeros_like(step_reward))
+            reward_components = self._accumulate_reward_components(
+                reward_components,
+                self._last_reward_components,
+                active_mask=active,
+            )
+
+            raw_terminated |= raw_terminated_step
+            truncated |= truncated_step
+            box_drop_failure_now |= box_drop_failure_step
+            terminated |= terminated_step
+
+            done_step = terminated_step | truncated_step
+            if done_step.any():
+                step_box_in_pit_now = self._check_box_in_pit()
+                box_in_pit_now |= step_box_in_pit_now & done_step
+                planner_done_reset_step = self._planner_done_reset_mask(
+                    box_drop_failure_step,
+                    raw_terminated_step,
+                    truncated_step,
+                )
+                planner_done_reset |= planner_done_reset_step
+                done_ids = done_step.nonzero(as_tuple=False).squeeze(-1)
+                done_metric_parts.append(
+                    self._compute_done_metrics(
+                        done_ids,
+                        step_box_in_pit_now,
+                        box_drop_failure_now=box_drop_failure_step,
+                        raw_terminated=raw_terminated_step,
+                        truncated=truncated_step,
+                        planner_success_reset=torch.zeros_like(planner_success_reset),
+                        planner_done_reset=planner_done_reset_step,
+                    )
+                )
+                if planner_done_reset_step.any():
+                    planner_done_reset_ids = planner_done_reset_step.nonzero(as_tuple=False).squeeze(-1)
+                    reset_obs, reset_info = self.unwrapped.reset(env_ids=planner_done_reset_ids)
+                    self._current_obs = reset_obs
+                    info["planner_done_reset_ids"] = planner_done_reset_ids
+                    info["planner_done_reset_info"] = reset_info
+                self._reset_done_env_tracking(done_ids, nav_cmd)
+
+            self._prev_box_pos_w = self.unwrapped.scene["box"].data.root_pos_w.detach().clone()
+
+        active = ~(terminated | truncated)
+        if active.any():
+            # Post-pit hold is counted in planner steps, not 50Hz low-level substeps.
+            current_box_in_pit_now = self._check_box_in_pit()
+            box_in_pit_now |= current_box_in_pit_now & active
+            _, post_pit_success_step = self._update_post_pit_state(current_box_in_pit_now & active)
+            post_pit_success_step = post_pit_success_step & active
+            post_pit_success_now |= post_pit_success_step
+            planner_done_now = post_pit_success_step
+            terminated |= planner_done_now
+            planner_done_reset_step = self._planner_done_reset_mask(planner_done_now, raw_terminated, truncated)
+            planner_success_reset_step = self._planner_success_reset_mask(
+                post_pit_success_step,
+                raw_terminated,
+                truncated,
+            )
+            planner_done_reset |= planner_done_reset_step
+            planner_success_reset |= planner_success_reset_step
+            if planner_done_now.any():
+                done_ids = planner_done_now.nonzero(as_tuple=False).squeeze(-1)
+                done_metric_parts.append(
+                    self._compute_done_metrics(
+                        done_ids,
+                        current_box_in_pit_now,
+                        box_drop_failure_now=torch.zeros_like(box_drop_failure_now),
+                        raw_terminated=torch.zeros_like(raw_terminated),
+                        truncated=torch.zeros_like(truncated),
+                        planner_success_reset=planner_success_reset_step,
+                        planner_done_reset=planner_done_reset_step,
+                    )
+                )
+                if planner_done_reset_step.any():
+                    planner_done_reset_ids = planner_done_reset_step.nonzero(as_tuple=False).squeeze(-1)
+                    reset_obs, reset_info = self.unwrapped.reset(env_ids=planner_done_reset_ids)
+                    self._current_obs = reset_obs
+                    info["planner_done_reset_ids"] = planner_done_reset_ids
+                    info["planner_done_reset_info"] = reset_info
+                planner_success_reset_ids = planner_success_reset_step.nonzero(as_tuple=False).squeeze(-1)
+                if planner_success_reset_ids.numel() > 0:
+                    info["planner_success_reset_ids"] = planner_success_reset_ids
+                self._reset_done_env_tracking(done_ids, nav_cmd)
+
+        if reward_components is not None:
+            self._last_reward_components = reward_components
+        info = dict(info)
+        info["planner_decimation_substeps"] = completed_substeps
+
+        # Attach done metrics after per-env reset bookkeeping has been handled in the substep loop.
         done = terminated | truncated
         if done.any():
             done_ids = done.nonzero(as_tuple=False).squeeze(-1)
             info = dict(info)
-            info["planner_done_metrics"] = self._compute_done_metrics(
-                done_ids,
-                post_pit_success_now,
-                box_drop_failure_now=box_drop_failure_now,
-                raw_terminated=raw_terminated,
-                truncated=truncated,
-                planner_success_reset=planner_success_reset,
-                planner_done_reset=planner_done_reset,
-            )
-            if planner_done_reset.any():
-                planner_done_reset_ids = planner_done_reset.nonzero(as_tuple=False).squeeze(-1)
-                reset_obs, reset_info = self.unwrapped.reset(env_ids=planner_done_reset_ids)
-                self._current_obs = reset_obs
-                info["planner_done_reset_ids"] = planner_done_reset_ids
-                info["planner_done_reset_info"] = reset_info
-                planner_success_reset_ids = planner_success_reset.nonzero(as_tuple=False).squeeze(-1)
-                if planner_success_reset_ids.numel() > 0:
-                    info["planner_success_reset_ids"] = planner_success_reset_ids
+            info["planner_done_metrics"] = self._merge_done_metric_parts(done_metric_parts)
             if not self._done_reason_printed:
                 robot_z = self.unwrapped.scene["robot"].data.root_pos_w[:, 2]
                 fell = robot_z < 0.25
@@ -257,21 +349,55 @@ class PlannerEnv(gym.Wrapper):
                 print(f"  current_proprio_head[0]={current_proprio[0, :16].tolist()}")
                 print(f"  synced_proprio_head[0]={synced_proprio[0, :16].tolist()}")
                 self._post_reset_sync_compare_printed = True
-            self._box_in_pit_given[done_ids] = False
-            self._box_in_pit_latched[done_ids] = False
-            self._post_pit_step_buf[done_ids] = 0
-            self._nav_cmd[done_ids] = 0.0
-            self._last_planner_action[done_ids] = 0.0
-            self._episode_step_buf[done_ids] = 0
-            # Reset GR00T history for done envs to avoid stale OOD input
-            proprio = self._current_obs["proprio"]
-            single_obs = self.low_level._build_obs(proprio, torch.zeros_like(nav_cmd))
-            self.low_level.reset_envs(done_ids, single_obs)
-            self._prev_box_pos_w = self.unwrapped.scene["box"].data.root_pos_w.detach().clone()
         else:
             self._prev_box_pos_w = self.unwrapped.scene["box"].data.root_pos_w.detach().clone()
 
         return self._build_planner_obs(self._current_obs), reward, terminated, truncated, info
+
+    def _accumulate_reward_components(
+        self,
+        running: dict[str, torch.Tensor] | None,
+        current: dict[str, torch.Tensor],
+        active_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if running is None:
+            running = {}
+            for key, value in current.items():
+                value = value.detach().clone()
+                if active_mask is not None:
+                    value = torch.where(active_mask, value, torch.zeros_like(value))
+                running[key] = value
+            return running
+        for key, value in current.items():
+            value = value.detach()
+            if active_mask is not None:
+                value = torch.where(active_mask, value, torch.zeros_like(value))
+            running[key] = running[key] + value
+        return running
+
+    def _merge_done_metric_parts(self, parts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        merged: dict[str, torch.Tensor] = {}
+        for part in parts:
+            for key, value in part.items():
+                value = value.reshape(-1)
+                if key not in merged:
+                    merged[key] = value
+                else:
+                    merged[key] = torch.cat((merged[key], value), dim=0)
+        return merged
+
+    def _reset_done_env_tracking(self, done_ids: torch.Tensor, nav_cmd: torch.Tensor) -> None:
+        self._box_in_pit_given[done_ids] = False
+        self._box_in_pit_latched[done_ids] = False
+        self._post_pit_step_buf[done_ids] = 0
+        self._nav_cmd[done_ids] = 0.0
+        nav_cmd[done_ids] = 0.0
+        self._last_planner_action[done_ids] = 0.0
+        self._episode_step_buf[done_ids] = 0
+        # Reset GR00T history immediately; later substeps may continue for other envs.
+        proprio = self._current_obs["proprio"]
+        single_obs = self.low_level._build_obs(proprio, torch.zeros_like(nav_cmd))
+        self.low_level.reset_envs(done_ids, single_obs)
 
     def get_observations(self):
         return self._build_planner_obs(self._current_obs)
@@ -500,14 +626,23 @@ class PlannerEnv(gym.Wrapper):
         return planner_done_now & (~raw_terminated) & (~truncated)
 
     def _update_post_pit_state(self, box_in_pit_now: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Latch pit entry and require a 150-step post-pit hold before success done."""
+        """Latch pit entry and require a stable 30-step post-pit hold before success done."""
         first_entry = box_in_pit_now & (~self._box_in_pit_latched)
         self._box_in_pit_latched |= box_in_pit_now
 
-        holding_after_pit = self._box_in_pit_latched & box_in_pit_now & (~first_entry)
+        robot_stable = self._robot_stable_on_ground()
+        stable_in_pit = self._box_in_pit_latched & box_in_pit_now & robot_stable
+        hold_broken = self._box_in_pit_latched & (~stable_in_pit)
+        self._post_pit_step_buf[hold_broken] = 0
+
+        holding_after_pit = stable_in_pit & (~first_entry)
         self._post_pit_step_buf[holding_after_pit] += 1
-        post_pit_success = box_in_pit_now & (self._post_pit_step_buf >= POST_PIT_HOLD_STEPS)
+        post_pit_success = stable_in_pit & (self._post_pit_step_buf >= POST_PIT_HOLD_STEPS)
         return first_entry, post_pit_success
+
+    def _robot_stable_on_ground(self) -> torch.Tensor:
+        robot_z = self.unwrapped.scene["robot"].data.root_pos_w[:, 2]
+        return robot_z >= ROBOT_STABLE_Z_THRESHOLD
 
     def _box_in_pit_success_reward(self) -> torch.Tensor:
         """One-time success bonus when the box falls below the pit threshold."""
@@ -522,13 +657,12 @@ class PlannerEnv(gym.Wrapper):
 
     def _stable_after_pit_reward(self) -> torch.Tensor:
         """Reward standing on the ground after the box has entered the pit."""
-        robot_z = self.unwrapped.scene["robot"].data.root_pos_w[:, 2]
         box_in_pit_now = self._check_box_in_pit()
         stable = (
             self._box_in_pit_latched
             & box_in_pit_now
             & (self._post_pit_step_buf > 0)
-            & (robot_z >= ROBOT_STABLE_Z_THRESHOLD)
+            & self._robot_stable_on_ground()
         )
         if hasattr(stable, "float"):
             stable = stable.float()
@@ -657,6 +791,7 @@ class PlannerEnv(gym.Wrapper):
             * box_entry_mask
             * box_y_axis_xz_plane_score
         )
+        stable_after_pit_reward = self._stable_after_pit_reward()
 
         # Obstacle penalty.
         obstacle_pen = self._obstacle_rect_penalty_xy(robot_xy_w) + self._obstacle_rect_penalty_xy(box_xy_w)
@@ -682,6 +817,7 @@ class PlannerEnv(gym.Wrapper):
             "box_in_pit": box_in_pit_reward,
             "box_y_axis_xz_plane": box_y_axis_xz_plane_reward,
             "box_in_pit_align_bonus": box_in_pit_align_bonus,
+            "stable_after_pit": stable_after_pit_reward,
             "obstacle": obstacle_reward,
             "alive": alive_reward,
             "time": time_reward,
@@ -695,6 +831,7 @@ class PlannerEnv(gym.Wrapper):
             + box_in_pit_reward
             + box_y_axis_xz_plane_reward
             + box_in_pit_align_bonus
+            + stable_after_pit_reward
             + obstacle_reward
             + alive_reward
             + time_reward
