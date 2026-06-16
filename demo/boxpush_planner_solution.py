@@ -24,8 +24,10 @@ NAV_CMD_MIN = torch.tensor([-1.5, -0.75, -1.0])
 NAV_CMD_MAX = torch.tensor([1.5, 0.75, 1.0])
 ACTION_SCALE = 0.25
 CLIP_ACTIONS = torch.tensor([0.5, 0.3, 0.3])
+PLANNER_DECIMATION = 5
 PLANNER_OBS_DIM = 372
 PLANNER_ACTION_DIM = 3
+DEFAULT_PLANNER_CHECKPOINT = "boxpush_planner_10hz.pt"
 
 
 def _as_2d_float_tensor(value: Any, *, device: torch.device) -> torch.Tensor:
@@ -75,7 +77,7 @@ class BoxPushPlannerSolution:
         self.planner_checkpoint = self._resolve_path(
             planner_checkpoint,
             env_name="ATEC_BOXPUSH_PLANNER_CHECKPOINT",
-            default_name="boxpush_planner.pt",
+            default_name=DEFAULT_PLANNER_CHECKPOINT,
         )
         self.walk_policy = self._resolve_path(
             walk_policy,
@@ -113,10 +115,12 @@ class BoxPushPlannerSolution:
             "walk_policy": str(self.walk_policy),
             "balance_policy": str(self.balance_policy),
             "compensate_official_dynamics": bool(compensate_official_dynamics),
+            "planner_decimation": PLANNER_DECIMATION,
         }
         print(
             "[BoxPushPlannerSolution] "
             f"device={self.device} planner={self.planner_checkpoint.name} "
+            f"planner_decimation={PLANNER_DECIMATION} "
             f"official_dynamics_compensation={bool(compensate_official_dynamics)}"
         )
 
@@ -139,7 +143,7 @@ class BoxPushPlannerSolution:
         self._last_planner_action = None
         self._step = 0
         self.low_level.reset(0)
-        self._debug_snapshot["stage"] = "reset"
+        self._debug_snapshot.update({"stage": "reset", "step": 0, "planner_phase": 0})
 
     def get_action_spec(self) -> dict[str, dict[str, Any]]:
         return {}
@@ -150,13 +154,16 @@ class BoxPushPlannerSolution:
         extero = _as_2d_float_tensor(obs["extero"], device=self.device)
         self._ensure_state(proprio.shape[0], proprio.dtype)
 
-        planner_obs = self._build_planner_obs(proprio, extero)
-        planner_action = self.planner.act_inference({"policy": planner_obs})
-        clip_actions = CLIP_ACTIONS.to(device=self.device, dtype=planner_action.dtype)
-        planner_action = torch.clamp(planner_action, -clip_actions, clip_actions)
-
-        self._nav_cmd = update_nav_command(self._nav_cmd, planner_action)
-        self._last_planner_action = planner_action.detach().clone()
+        planner_updated = self._step % PLANNER_DECIMATION == 0
+        if planner_updated:
+            planner_obs = self._build_planner_obs(proprio, extero)
+            planner_action = self.planner.act_inference({"policy": planner_obs})
+            clip_actions = CLIP_ACTIONS.to(device=self.device, dtype=planner_action.dtype)
+            planner_action = torch.clamp(planner_action, -clip_actions, clip_actions)
+            self._nav_cmd = update_nav_command(self._nav_cmd, planner_action)
+            self._last_planner_action = planner_action.detach().clone()
+        else:
+            planner_action = self._last_planner_action
 
         low_action = self.low_level.predict({"proprio": proprio}, self._nav_cmd)
         self._step += 1
@@ -165,6 +172,8 @@ class BoxPushPlannerSolution:
                 "stage": "planner_low_level",
                 "step": self._step,
                 "score": float(current_score),
+                "planner_updated": bool(planner_updated),
+                "planner_phase": self._step % PLANNER_DECIMATION,
                 "nav_cmd": self._nav_cmd[0].detach().cpu().tolist(),
                 "planner_action": planner_action[0].detach().cpu().tolist(),
                 "action_head": low_action[0, :8].detach().cpu().tolist(),
@@ -178,6 +187,7 @@ class BoxPushPlannerSolution:
         self._num_envs = int(num_envs)
         self._nav_cmd = torch.zeros(num_envs, 3, device=self.device, dtype=dtype)
         self._last_planner_action = torch.zeros(num_envs, 3, device=self.device, dtype=dtype)
+        self._step = 0
         self.low_level.reset(num_envs)
 
     def _build_planner_obs(self, proprio: torch.Tensor, extero: torch.Tensor) -> torch.Tensor:
