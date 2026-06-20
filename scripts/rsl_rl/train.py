@@ -4,12 +4,44 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+
+
+def _configure_rank_local_isaac_state() -> None:
+    """Give each torchrun rank separate Isaac/Kit state directories before AppLauncher starts."""
+
+    if os.environ.get("ATEC_PER_RANK_OMNI_STATE", "0") != "1":
+        return
+
+    local_rank = os.environ.get("LOCAL_RANK")
+    state_root = os.environ.get("ATEC_RANK_STATE_ROOT")
+    if local_rank is None or not state_root:
+        return
+
+    rank_root = Path(state_root) / f"rank{local_rank}"
+    paths = {
+        "TMPDIR": rank_root / "tmp",
+        "XDG_CACHE_HOME": rank_root / "cache",
+        "XDG_CONFIG_HOME": rank_root / "config",
+        "XDG_DATA_HOME": rank_root / "data",
+        "OMNI_USER_CACHE_DIR": rank_root / "omniverse-cache",
+        "OMNI_USER_DATA_DIR": rank_root / "omniverse-data",
+        "OMNI_USER_LOG_DIR": rank_root / "omniverse-logs",
+    }
+    for key, path in paths.items():
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[key] = str(path)
+
+
+_configure_rank_local_isaac_state()
+
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -27,6 +59,12 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--fast_exit",
+    action="store_true",
+    default=False,
+    help="Exit the worker process after training without waiting for Isaac/Kit shutdown.",
+)
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
@@ -96,6 +134,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import atec_rl_lab.train  # noqa: F401  # isort: skip
+from scripts.rsl_rl.resume_state import sync_resume_training_state
 
 # import logger
 logger = logging.getLogger(__name__)
@@ -134,8 +173,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
         agent_cfg.device = f"cuda:{app_launcher.local_rank}"
 
-        # set seed to have diversity in different threads
-        seed = agent_cfg.seed + app_launcher.local_rank
+        # set seed to have diversity across distributed ranks. In per-rank launchers
+        # every process may intentionally use LOCAL_RANK=0 with a single visible GPU.
+        seed = agent_cfg.seed + app_launcher.global_rank
         env_cfg.seed = seed
         agent_cfg.seed = seed
 
@@ -205,6 +245,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        resume_state = sync_resume_training_state(env, runner)
+        if resume_state is not None and (not getattr(runner, "is_distributed", False) or runner.gpu_global_rank == 0):
+            print(
+                "[INFO]: Synced resumed training state: "
+                f"iteration={resume_state.iteration}, "
+                f"common_step_counter={resume_state.common_step_counter}, "
+                f"total_timesteps={resume_state.total_timesteps}"
+            )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
@@ -222,5 +270,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 if __name__ == "__main__":
     # run the main function
     main()
+    if args_cli.fast_exit:
+        os._exit(0)
     # close sim app
     simulation_app.close()

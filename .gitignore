@@ -4,6 +4,8 @@ atec_robot_model
 video
 logs
 tmp
+tmp_isaaclab/
+IsaacLab/
 
 # C++
 **/cmake-build*/
@@ -80,4 +82,3 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
-

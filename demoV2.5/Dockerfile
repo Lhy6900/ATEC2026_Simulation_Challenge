@@ -31,7 +31,7 @@ COPY --chown=admin:admin run.sh ./solution/
 COPY --chown=admin:admin requirements.txt ./solution/
 COPY --chown=admin:admin server.py ./solution/
 
-# demo: TaskD push box, then switch to the verified blind cross-pit policy.
+# demoV2.5: TaskD push box, then switch at 9.5 s to the counter-950 blind cross-pit policy.
 COPY --chown=admin:admin solution.py ./solution/solution.py
 COPY --chown=admin:admin boxpush_planner_solution.py ./solution/
 COPY --chown=admin:admin boxpush_low_level.py ./solution/
@@ -41,7 +41,7 @@ COPY --chown=admin:admin boxpush_planner_v2.pt ./solution/
 COPY --chown=admin:admin boxpush_planner_10hz.pt ./solution/
 COPY --chown=admin:admin gr00t_walk.pt ./solution/
 COPY --chown=admin:admin gr00t_balance.pt ./solution/
-COPY --chown=admin:admin cross_pit_box_v1_5_blind_model_19999.pt ./solution/
+COPY --chown=admin:admin cross_pit_box_v2_5_blind_model_19999.pt ./solution/
 
 # demo1: 全 O demo
 # COPY --chown=admin:admin solution_zero.py ./solution/solution.py

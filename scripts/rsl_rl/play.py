@@ -29,6 +29,12 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--cross_pit_success_x",
+    type=float,
+    default=None,
+    help="Fix the CrossPitBox success target x during play, instead of starting from curriculum default.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -63,7 +69,6 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
@@ -85,6 +90,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Play with RSL-RL agent."""
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
+    is_cross_pit_box_task = (
+        task_name.endswith("CrossPitBox-v0")
+        or task_name.endswith("CrossPitBox-v1")
+        or task_name.endswith("CrossPitBox-v1.5")
+        or task_name.endswith("CrossPitBox-v2")
+        or task_name.endswith("CrossPitBox-v2.5")
+    )
 
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -96,9 +108,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # spawn the robot randomly in the grid (instead of their terrain levels)
-    env_cfg.scene.terrain.max_init_terrain_level = None
-    # reduce the number of terrains to save memory
-    if env_cfg.scene.terrain.terrain_generator is not None:
+    if not is_cross_pit_box_task:
+        env_cfg.scene.terrain.max_init_terrain_level = None
+    # reduce the number of terrains to save memory. CrossPitBox is a fixed single-tile handoff scene.
+    if not is_cross_pit_box_task and env_cfg.scene.terrain.terrain_generator is not None:
         env_cfg.scene.terrain.terrain_generator.num_rows = 5
         env_cfg.scene.terrain.terrain_generator.num_cols = 5
         env_cfg.scene.terrain.terrain_generator.curriculum = False
@@ -110,6 +123,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.events.push_robot = None
     env_cfg.curriculum.command_levels_lin_vel = None
     env_cfg.curriculum.command_levels_ang_vel = None
+    if is_cross_pit_box_task and args_cli.cross_pit_success_x is not None:
+        env_cfg.curriculum.success_x = None
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -120,8 +135,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
             return
-    elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
@@ -129,9 +142,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+    if hasattr(env_cfg, "sim") and hasattr(env_cfg.sim, "log_dir"):
+        env_cfg.sim.log_dir = log_dir
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if is_cross_pit_box_task and args_cli.cross_pit_success_x is not None:
+        env.unwrapped.cross_pit_success_x = float(args_cli.cross_pit_success_x)
+        print(f"[INFO] Fixed CrossPitBox play success target x: {env.unwrapped.cross_pit_success_x:.4f}")
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):

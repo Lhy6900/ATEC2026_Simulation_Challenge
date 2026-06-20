@@ -33,9 +33,12 @@ class AlgSolution:
         )
         self._cross_pit = None
         self._cross_pit_kwargs = {
+            "model_path": os.environ.get("ATEC_CROSS_PIT_BOX_CHECKPOINT", "cross_pit_box_v2_5_blind_model_19999.pt"),
             "target_x": 5.8,
             "forward_command": float(os.environ.get("ATEC_CROSS_PIT_FORWARD_COMMAND", "0.6644027")),
-            "stabilize_vel_gain": 0.025,
+            "stabilize_vel_gain": 0.0,
+            "stabilize_steps": 0,
+            "initial_last_action": os.environ.get("ATEC_CROSS_PIT_INITIAL_LAST_ACTION", "env_raw"),
             "handoff_blend_steps": 0,
             "handoff_max_delta": 0.0,
             "require_deploy_defaults": os.environ.get("ATEC_CROSS_PIT_REQUIRE_DEPLOY_DEFAULTS", "1")
@@ -44,7 +47,7 @@ class AlgSolution:
             in ("1", "true", "yes", "on"),
         }
         self._impl = self._boxpush
-        default_handoff_time = 13.0 if handoff_time_s is None else handoff_time_s
+        default_handoff_time = 9.5 if handoff_time_s is None else handoff_time_s
         default_step_dt = 0.02 if step_dt is None else step_dt
         self._handoff_time_s = float(os.environ.get("ATEC_CROSS_PIT_HANDOFF_TIME", default_handoff_time))
         self._step_dt = float(os.environ.get("ATEC_DEMO_STEP_DT", default_step_dt))
