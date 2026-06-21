@@ -686,6 +686,26 @@ def test_cross_pit_d435_offset_tracks_waist_pose_from_native_logs():
     assert torch.allclose(offset, expected, atol=0.003)
 
 
+def test_cross_pit_d435_yaw_tracks_waist_pose_from_native_logs():
+    from demo.cross_pit_box_policy import estimate_d435_link_yaw_from_base_yaw_and_waist
+
+    root_yaw = torch.tensor([0.0996, 0.5956, 0.8308, 1.0368], dtype=torch.float32)
+    waist = torch.tensor(
+        [
+            [-0.3239, -0.1328, 0.2991],
+            [-0.0191, -0.5204, -0.2634],
+            [-0.3484, -0.5205, -0.4571],
+            [-0.6668, -0.5200, -0.5234],
+        ],
+        dtype=torch.float32,
+    )
+
+    yaw = estimate_d435_link_yaw_from_base_yaw_and_waist(root_yaw, waist)
+
+    expected = torch.tensor([-0.3072, 0.3427, 0.3117, 0.2311], dtype=torch.float32)
+    assert torch.allclose(yaw, expected, atol=0.04)
+
+
 def test_cross_pit_policy_terrain_map_uses_dynamic_d435_offset_from_waist(monkeypatch):
     from demo.cross_pit_box_policy import CROSS_PIT_RESET_ACTION, CrossPitBoxPolicy, HEIGHTMAP_DIM
 

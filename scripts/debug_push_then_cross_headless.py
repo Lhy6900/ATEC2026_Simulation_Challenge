@@ -155,6 +155,7 @@ def _robot_state(env: gym.Env) -> dict[str, float]:
     try:
         robot = env.unwrapped.scene["robot"]
         root_pos = robot.data.root_pos_w[0]
+        root_quat = robot.data.root_quat_w[0]
         env_origins = getattr(env.unwrapped.scene, "env_origins", None)
         if env_origins is None:
             env_origin = torch.zeros(3, device=root_pos.device, dtype=root_pos.dtype)
@@ -163,10 +164,17 @@ def _robot_state(env: gym.Env) -> dict[str, float]:
         root_pos_env = root_pos - env_origin
         root_vel = robot.data.root_vel_w[0]
         gravity = robot.data.projected_gravity_b[0]
+        qw, qx, qy, qz = root_quat
+        root_yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
         return {
             "root_x": float(root_pos[0].item()),
             "root_y": float(root_pos[1].item()),
             "root_z": float(root_pos[2].item()),
+            "root_qw": float(qw.item()),
+            "root_qx": float(qx.item()),
+            "root_qy": float(qy.item()),
+            "root_qz": float(qz.item()),
+            "root_yaw": float(root_yaw.item()),
             "env_origin_x": float(env_origin[0].item()),
             "env_origin_y": float(env_origin[1].item()),
             "env_origin_z": float(env_origin[2].item()),
@@ -528,7 +536,6 @@ def main() -> int:
 
             raw_done = bool(terminated.detach().any().item() or truncated.detach().any().item())
             terms = _done_terms(env)
-            crossed = crossed or bool(terms.get("x_reached", False))
             snapshot = solution.get_debug_snapshot() if hasattr(solution, "get_debug_snapshot") else {}
             done = raw_done and total_elapsed_time >= args_cli.ignore_done_until_s
             record = _frame_record(
@@ -545,6 +552,11 @@ def main() -> int:
             )
             record["raw_done"] = raw_done
             record["ignored_done"] = bool(raw_done and not done)
+            # Query done terms after frame recording as well. Some IsaacLab
+            # managers reset terminated envs lazily around observation/log
+            # access, so the pre-record query can occasionally be stale.
+            terms = record["done_terms"]
+            crossed = crossed or bool(terms.get("x_reached", False))
             should_trace = args_cli.trace_start_s <= total_elapsed_time <= args_cli.trace_end_s
             pre_should_trace = args_cli.trace_start_s <= pre_record["env_elapsed"] <= args_cli.trace_end_s
             should_print = raw_done or should_trace or (args_cli.print_interval > 0 and step % args_cli.print_interval == 0)

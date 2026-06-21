@@ -46,6 +46,7 @@ DEFAULT_INITIAL_LAST_ACTION = "zero"
 DEFAULT_D435_LINK_OFFSET_B = (0.1885, 0.0052, 0.4331)
 D435_WAIST_BASE_OFFSET_B = (-0.00063307, -0.00047869, 0.04387194)
 D435_WAIST_LINK_OFFSET = (0.05463455, 0.01787839, 0.43122387)
+D435_YAW_FROM_WAIST_COEFF = (0.99196511, 0.93137226, -0.31045014, 0.15873502)
 
 CROSS_PIT_TRAINING_JOINT_NAMES = (
     "left_hip_pitch_joint",
@@ -393,6 +394,47 @@ def estimate_d435_link_offset_b_from_waist(waist_yaw_roll_pitch: torch.Tensor) -
     return base + torch.bmm(_rotation_matrix_zxy(waist), link.expand(waist.shape[0], -1, -1)).squeeze(-1)
 
 
+def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def estimate_d435_link_yaw_from_base_yaw_and_waist(
+    base_yaw: torch.Tensor,
+    waist_yaw_roll_pitch: torch.Tensor,
+) -> torch.Tensor:
+    """Estimate d435_link world yaw for the CrossPitBox yaw-aligned ray grid.
+
+    IsaacLab's ``ray_alignment="yaw"`` rotates the grid by the tracked
+    ``d435_link`` yaw, not by the robot root yaw.  The official TaskD solution
+    API does not expose the link pose, so this deploy-time approximation is
+    calibrated from native CrossPitBox logs around the counter-650 handoff.
+    """
+    if base_yaw.ndim == 0:
+        base_yaw = base_yaw.unsqueeze(0)
+    if waist_yaw_roll_pitch.ndim == 1:
+        waist_yaw_roll_pitch = waist_yaw_roll_pitch.unsqueeze(0)
+    if waist_yaw_roll_pitch.shape[-1] != 3:
+        raise ValueError(f"Expected waist_yaw_roll_pitch shape (N, 3), got {tuple(waist_yaw_roll_pitch.shape)}")
+    if base_yaw.ndim == 2 and base_yaw.shape[-1] == 1:
+        base_yaw = base_yaw[:, 0]
+    if base_yaw.ndim != 1:
+        raise ValueError(f"Expected base_yaw shape (N,), got {tuple(base_yaw.shape)}")
+    if base_yaw.shape[0] == 1 and waist_yaw_roll_pitch.shape[0] > 1:
+        base_yaw = base_yaw.expand(waist_yaw_roll_pitch.shape[0])
+    if base_yaw.shape[0] != waist_yaw_roll_pitch.shape[0]:
+        raise ValueError(
+            f"base_yaw batch size {base_yaw.shape[0]} does not match waist batch size {waist_yaw_roll_pitch.shape[0]}"
+        )
+    coeff = waist_yaw_roll_pitch.new_tensor(D435_YAW_FROM_WAIST_COEFF)
+    relative_yaw = (
+        coeff[0] * waist_yaw_roll_pitch[:, 0]
+        + coeff[1] * waist_yaw_roll_pitch[:, 1]
+        + coeff[2] * waist_yaw_roll_pitch[:, 2]
+        + coeff[3]
+    )
+    return _wrap_to_pi(base_yaw.to(device=waist_yaw_roll_pitch.device, dtype=waist_yaw_roll_pitch.dtype) + relative_yaw)
+
+
 def _yaw_from_quat_wxyz(quat: torch.Tensor) -> torch.Tensor:
     if quat.ndim == 1:
         quat = quat.unsqueeze(0)
@@ -545,6 +587,7 @@ def terrain_map_heightmap(
     yaw: torch.Tensor,
     projected_gravity: torch.Tensor | None = None,
     d435_link_offset_b: torch.Tensor | None = None,
+    ray_yaw: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Approximate the training d435_link downward raycast heightmap from fixed TaskD geometry."""
     if local_x.ndim == 1:
@@ -578,6 +621,17 @@ def terrain_map_heightmap(
     sin_roll = torch.sin(roll)
     sin_pitch = torch.sin(pitch)
     cos_pitch = torch.cos(pitch)
+    if ray_yaw is None:
+        ray_yaw = yaw
+    elif ray_yaw.ndim == 1:
+        ray_yaw = ray_yaw.unsqueeze(1)
+    ray_yaw = ray_yaw.to(device=device, dtype=dtype)
+    if ray_yaw.shape[0] == 1 and local_x.shape[0] > 1:
+        ray_yaw = ray_yaw.expand(local_x.shape[0], -1)
+    if ray_yaw.shape != yaw.shape:
+        raise ValueError(f"ray_yaw shape {tuple(ray_yaw.shape)} does not match yaw shape {tuple(yaw.shape)}")
+    cos_ray_yaw = torch.cos(ray_yaw)
+    sin_ray_yaw = torch.sin(ray_yaw)
 
     if d435_link_offset_b is None:
         d435_offset = torch.zeros((local_x.shape[0], 3), device=device, dtype=dtype)
@@ -594,15 +648,15 @@ def terrain_map_heightmap(
                 f"d435_link_offset_b batch size {d435_offset.shape[0]} does not match {local_x.shape[0]}"
             )
 
-    # MultiMeshRayCasterCfg(ray_alignment="yaw") keeps the scan grid aligned
-    # with heading, not full body roll/pitch. The sensor is attached to d435_link,
-    # so the ray grid origin follows the camera link rather than the base/root.
+    # MultiMeshRayCasterCfg(ray_alignment="yaw") rotates ray starts by the
+    # tracked d435_link yaw, not by the root yaw.  The d435 link still follows
+    # the base/root position through its base-frame offset.
     sensor_dx = cos_yaw * d435_offset[:, 0:1] - sin_yaw * d435_offset[:, 1:2]
     sensor_dy = sin_yaw * d435_offset[:, 0:1] + cos_yaw * d435_offset[:, 1:2]
     sensor_x = local_x + sensor_dx
     sensor_y = local_y + sensor_dy
-    world_dx = cos_yaw * rel_x - sin_yaw * rel_y
-    world_dy = sin_yaw * rel_x + cos_yaw * rel_y
+    world_dx = cos_ray_yaw * rel_x - sin_ray_yaw * rel_y
+    world_dy = sin_ray_yaw * rel_x + cos_ray_yaw * rel_y
     hit_x = sensor_x + world_dx
     hit_y = sensor_y + world_dy
 
@@ -974,6 +1028,7 @@ class CrossPitBoxPolicy:
                 "joint_vel_actor_norm": float(policy_obs[:, 42:75].norm(dim=-1).mean().detach().cpu()),
                 "local_x": float(self._local_xy_yaw[0, 0].detach().cpu()) if self._local_xy_yaw is not None else None,
                 "local_y": float(self._local_xy_yaw[0, 1].detach().cpu()) if self._local_xy_yaw is not None else None,
+                "local_yaw": float(self._local_xy_yaw[0, 2].detach().cpu()) if self._local_xy_yaw is not None else None,
                 "local_root_z": float(self._local_root_z[0].detach().cpu()) if self._local_root_z is not None else None,
             }
         )
@@ -1078,9 +1133,28 @@ class CrossPitBoxPolicy:
                 local_xy_yaw = debug_local_xy_yaw
             if self._local_root_z is None:
                 self._local_root_z = proprio.new_full((proprio.shape[0],), CROSS_PIT_HANDOFF_ROOT_Z)
-            d435_link_offset_b = self._estimate_current_d435_link_offset_b()
+            d435_link_offset_b, d435_ray_yaw = self._estimate_current_d435_scan_pose()
             if d435_link_offset_b is None:
                 d435_link_offset_b = proprio.new_tensor(DEFAULT_D435_LINK_OFFSET_B).view(1, 3)
+            ray_yaw_mode = os.environ.get("ATEC_CROSS_PIT_TERRAIN_RAY_YAW_MODE", "d435").strip().lower()
+            if ray_yaw_mode == "d435":
+                ray_yaw = d435_ray_yaw
+            elif ray_yaw_mode == "root":
+                ray_yaw = local_xy_yaw[:, 2]
+            elif ray_yaw_mode == "world":
+                ray_yaw = torch.zeros_like(local_xy_yaw[:, 2])
+            elif ray_yaw_mode == "handoff":
+                ray_yaw = torch.full_like(local_xy_yaw[:, 2], CROSS_PIT_HANDOFF_YAW)
+            else:
+                raise ValueError(
+                    "ATEC_CROSS_PIT_TERRAIN_RAY_YAW_MODE must be one of "
+                    f"'d435', 'root', 'world', or 'handoff', got {ray_yaw_mode!r}"
+                )
+            self._debug_snapshot["terrain_ray_yaw_mode"] = ray_yaw_mode
+            self._debug_snapshot["d435_ray_yaw"] = (
+                float(d435_ray_yaw[0].detach().cpu()) if d435_ray_yaw is not None else None
+            )
+            self._debug_snapshot["terrain_ray_yaw"] = float(ray_yaw[0].detach().cpu()) if ray_yaw is not None else None
             return terrain_map_heightmap(
                 local_xy_yaw[:, 0],
                 local_xy_yaw[:, 1],
@@ -1088,6 +1162,7 @@ class CrossPitBoxPolicy:
                 local_xy_yaw[:, 2],
                 projected_gravity=proprio[:, 9:12],
                 d435_link_offset_b=d435_link_offset_b.to(device=proprio.device, dtype=proprio.dtype),
+                ray_yaw=ray_yaw.to(device=proprio.device, dtype=proprio.dtype) if ray_yaw is not None else None,
             )
 
         if self.heightmap_source == "head_depth":
@@ -1129,11 +1204,11 @@ class CrossPitBoxPolicy:
         self._debug_snapshot["heightmap_source_actual"] = "constant"
         return torch.full((self._num_envs, HEIGHTMAP_DIM), -1.0, device=self.device, dtype=torch.float32)
 
-    def _estimate_current_d435_link_offset_b(self) -> torch.Tensor | None:
+    def _current_waist_yaw_roll_pitch(self) -> torch.Tensor | None:
         if self._current_joint_pos_rel is None:
             return None
         joint_pos_native = self._taskd_to_observation(self._current_joint_pos_rel)
-        waist = torch.stack(
+        return torch.stack(
             (
                 joint_pos_native[:, CROSS_PIT_OBSERVATION_JOINT_NAMES.index("waist_yaw_joint")],
                 joint_pos_native[:, CROSS_PIT_OBSERVATION_JOINT_NAMES.index("waist_roll_joint")],
@@ -1141,6 +1216,21 @@ class CrossPitBoxPolicy:
             ),
             dim=-1,
         )
+
+    def _estimate_current_d435_scan_pose(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        waist = self._current_waist_yaw_roll_pitch()
+        if waist is None:
+            return None, None
+        d435_offset = estimate_d435_link_offset_b_from_waist(waist)
+        if self._local_xy_yaw is None:
+            return d435_offset, None
+        d435_yaw = estimate_d435_link_yaw_from_base_yaw_and_waist(self._local_xy_yaw[:, 2], waist)
+        return d435_offset, d435_yaw
+
+    def _estimate_current_d435_link_offset_b(self) -> torch.Tensor | None:
+        waist = self._current_waist_yaw_roll_pitch()
+        if waist is None:
+            return None
         return estimate_d435_link_offset_b_from_waist(waist)
 
     def _heading_command(

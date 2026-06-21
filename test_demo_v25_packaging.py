@@ -61,7 +61,7 @@ def test_demo_v25_solution_defaults_to_9p5s_handoff_and_final_v25_checkpoint():
 
     assert "default_handoff_time = 9.5" in solution_text
     assert "cross_pit_box_v2_5_blind_model_19999.pt" in solution_text
-    assert '"target_x": 5.8' in solution_text
+    assert '"target_x": 7.8' in solution_text
     assert '"stabilize_vel_gain": 0.0' in solution_text
     assert '"stabilize_steps": 0' in solution_text
     assert '"initial_last_action": os.environ.get("ATEC_CROSS_PIT_INITIAL_LAST_ACTION", "env_raw")' in solution_text
@@ -91,7 +91,7 @@ def test_demo_v25_policy_loads_v25_blind_checkpoint_with_9p5s_defaults(monkeypat
     assert policy.model_path.name == "cross_pit_box_v2_5_blind_model_19999.pt"
     assert policy.actor_obs_dim == policy_module.BLIND_ACTOR_OBS_DIM
     assert not policy.uses_heightmap
-    assert policy.target_x == pytest.approx(5.8)
+    assert policy.target_x == pytest.approx(7.8)
     assert policy.stabilize_steps == 0
     assert policy.stabilize_vel_gain == pytest.approx(0.0)
     assert policy.initial_last_action == "env_raw"

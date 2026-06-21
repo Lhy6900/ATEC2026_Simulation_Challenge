@@ -34,7 +34,7 @@ class AlgSolution:
         self._cross_pit = None
         self._cross_pit_kwargs = {
             "model_path": os.environ.get("ATEC_CROSS_PIT_BOX_CHECKPOINT", "cross_pit_box_v2_5_blind_model_19999.pt"),
-            "target_x": 5.8,
+            "target_x": 7.8,
             "forward_command": float(os.environ.get("ATEC_CROSS_PIT_FORWARD_COMMAND", "0.6644027")),
             "stabilize_vel_gain": 0.0,
             "stabilize_steps": 0,
@@ -57,7 +57,7 @@ class AlgSolution:
             "no",
             "off",
         }
-        self._walkout_trigger_x = float(os.environ.get("ATEC_WALKOUT_TRIGGER_X", "5.80"))
+        self._walkout_trigger_x = float(os.environ.get("ATEC_WALKOUT_TRIGGER_X", "7.80"))
         self._walkout_trigger_z = float(os.environ.get("ATEC_WALKOUT_TRIGGER_Z", "0.45"))
         self._walkout_max_abs_y = float(os.environ.get("ATEC_WALKOUT_MAX_ABS_Y", "2.50"))
         self._walkout_command = [
